@@ -85,6 +85,22 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="",
                 description="Comma-separated names for label ids 1..N (optional).",
             ),
+            DeclareLaunchArgument("enable_frcnn", default_value="false"),
+            DeclareLaunchArgument(
+                "frcnn_weights",
+                default_value=os.path.join(
+                    default_root, "models", "run_20260407_223752", "frcnn_det_best.pt"
+                )
+                if default_root
+                else "",
+            ),
+            DeclareLaunchArgument(
+                "frcnn_num_classes",
+                default_value="13",
+                description="Total classes including background (torchvision convention).",
+            ),
+            DeclareLaunchArgument("frcnn_score_threshold", default_value="0.5"),
+            DeclareLaunchArgument("frcnn_class_names", default_value=""),
             Node(
                 package="vision_benchmark_ros",
                 executable="isaac_multitask_node",
@@ -110,6 +126,11 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "mask_rcnn_input_size": LaunchConfiguration("mask_rcnn_input_size"),
                         "mask_rcnn_class_names": LaunchConfiguration("mask_rcnn_class_names"),
+                        "enable_frcnn": LaunchConfiguration("enable_frcnn"),
+                        "frcnn_weights": LaunchConfiguration("frcnn_weights"),
+                        "frcnn_num_classes": LaunchConfiguration("frcnn_num_classes"),
+                        "frcnn_score_threshold": LaunchConfiguration("frcnn_score_threshold"),
+                        "frcnn_class_names": LaunchConfiguration("frcnn_class_names"),
                     }
                 ],
             ),

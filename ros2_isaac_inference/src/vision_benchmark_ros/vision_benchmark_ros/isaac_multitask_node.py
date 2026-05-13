@@ -121,6 +121,50 @@ def _draw_pose_block(img: np.ndarray, pose: np.ndarray, y0: int = 24) -> None:
         y += 22
 
 
+def _build_faster_rcnn(num_classes: int):
+    from torchvision.models.detection import fasterrcnn_resnet50_fpn
+    from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+
+    model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None)
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    return model
+
+
+def _overlay_boxes(
+    img_bgr: np.ndarray,
+    out: dict,
+    score_thr: float,
+    class_names: list[str] | None,
+    color: tuple[int, int, int] = (0, 255, 255),
+) -> None:
+    boxes = out["boxes"].cpu().numpy()
+    labels = out["labels"].cpu().numpy()
+    scores = out["scores"].cpu().numpy()
+    for i in range(len(scores)):
+        if scores[i] < score_thr:
+            continue
+        lab = int(labels[i])
+        if lab == 0:
+            continue
+        x1, y1, x2, y2 = boxes[i].astype(int)
+        cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, 2)
+        name = ""
+        if class_names and 0 <= lab - 1 < len(class_names):
+            name = class_names[lab - 1]
+        cap = f"{lab}:{name} {scores[i]:.2f}" if name else f"id={lab} {scores[i]:.2f}"
+        cv2.putText(
+            img_bgr,
+            cap,
+            (x1, max(y1 - 6, 16)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+
 def _build_mask_rcnn(num_classes: int):
     import torch
     from torchvision.models.detection import maskrcnn_resnet50_fpn
@@ -209,10 +253,16 @@ class IsaacMultitaskNode(Node):
         self.declare_parameter("mask_rcnn_score_threshold", 0.5)
         self.declare_parameter("mask_rcnn_input_size", 640)
         self.declare_parameter("mask_rcnn_class_names", "")
+        self.declare_parameter("enable_frcnn", False)
+        self.declare_parameter("frcnn_weights", "")
+        self.declare_parameter("frcnn_num_classes", 13)
+        self.declare_parameter("frcnn_score_threshold", 0.5)
+        self.declare_parameter("frcnn_class_names", "")
         self.declare_parameter("log_pose_each_frame", False)
 
         self._enable_pose = _read_bool(self, "enable_pose")
         self._enable_mcnn = _read_bool(self, "enable_mask_rcnn")
+        self._enable_frcnn = _read_bool(self, "enable_frcnn")
 
         root = self.get_parameter("vision_benchmark_root").get_parameter_value().string_value
         if not root.strip():
@@ -277,9 +327,38 @@ class IsaacMultitaskNode(Node):
                 f"Loaded Mask R-CNN ({ncls} classes) from {wpath} on {self._mcnn_device}."
             )
 
-        if not self._enable_pose and not self._enable_mcnn:
+        self._frcnn = None
+        self._frcnn_device = None
+        self._frcnn_thr = _read_double(self, "frcnn_score_threshold")
+        frcnn_names_csv = self.get_parameter("frcnn_class_names").get_parameter_value().string_value
+        self._frcnn_class_names = (
+            [s.strip() for s in frcnn_names_csv.split(",") if s.strip()] if frcnn_names_csv else None
+        )
+
+        if self._enable_frcnn:
+            import torch
+
+            fwpath = self.get_parameter("frcnn_weights").get_parameter_value().string_value
+            if not fwpath:
+                self.get_logger().fatal("enable_frcnn requires frcnn_weights path.")
+                raise RuntimeError("frcnn_weights missing")
+            fncls = _read_int(self, "frcnn_num_classes")
+            use_cuda = _read_bool(self, "use_cuda")
+            self._frcnn_device = torch.device(
+                "cuda" if use_cuda and torch.cuda.is_available() else "cpu"
+            )
+            self._frcnn = _build_faster_rcnn(fncls)
+            ckpt = torch.load(fwpath, map_location=self._frcnn_device)
+            state = ckpt.get("model", ckpt)
+            self._frcnn.load_state_dict(state)
+            self._frcnn = self._frcnn.to(self._frcnn_device).eval()
+            self.get_logger().info(
+                f"Loaded Faster R-CNN ({fncls} classes) from {fwpath} on {self._frcnn_device}."
+            )
+
+        if not self._enable_pose and not self._enable_mcnn and not self._enable_frcnn:
             self.get_logger().warn(
-                "Both enable_pose and enable_mask_rcnn are false; output image mirrors input."
+                "enable_pose, enable_mask_rcnn, and enable_frcnn are all false; output mirrors input."
             )
 
         itopic = self.get_parameter("image_topic").get_parameter_value().string_value
@@ -354,6 +433,16 @@ class IsaacMultitaskNode(Node):
                     mup.append(mi)
                 det["masks"] = torch.cat(mup, dim=0)
             _overlay_masks(vis, det, self._mcnn_thr, self._mcnn_class_names, self._mask_rng)
+
+        if self._frcnn is not None:
+            import torch
+            from torchvision import transforms
+
+            rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+            x = transforms.ToTensor()(rgb).to(self._frcnn_device)
+            with torch.no_grad():
+                det = self._frcnn([x])[0]
+            _overlay_boxes(vis, det, self._frcnn_thr, self._frcnn_class_names)
 
         try:
             out_msg = _bgr_to_imgmsg(vis, encoding="bgr8")
