@@ -19,7 +19,28 @@ from rcl_interfaces.msg import ParameterType
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import Float64MultiArray, String
-from cv_bridge import CvBridge
+
+
+def _imgmsg_to_bgr(msg: Image) -> np.ndarray:
+    """Convert sensor_msgs/Image to BGR uint8 without cv_bridge (NumPy 2.x safe)."""
+    h, w = msg.height, msg.width
+    if msg.encoding in ("bgr8", "8UC3"):
+        arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w, 3)
+        return np.ascontiguousarray(arr)
+    if msg.encoding in ("rgb8",):
+        arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w, 3)
+        return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    raise ValueError(f"unsupported image encoding: {msg.encoding}")
+
+
+def _bgr_to_imgmsg(img: np.ndarray, encoding: str = "bgr8") -> Image:
+    out = Image()
+    out.height, out.width = img.shape[:2]
+    out.encoding = encoding
+    out.is_bigendian = 0
+    out.step = img.shape[1] * 3
+    out.data = np.ascontiguousarray(img).tobytes()
+    return out
 
 
 def _param_type(value) -> int:
@@ -261,7 +282,6 @@ class IsaacMultitaskNode(Node):
                 "Both enable_pose and enable_mask_rcnn are false; output image mirrors input."
             )
 
-        self._bridge = CvBridge()
         itopic = self.get_parameter("image_topic").get_parameter_value().string_value
         atopic = self.get_parameter("annotated_image_topic").get_parameter_value().string_value
         ptopic = self.get_parameter("pose_text_topic").get_parameter_value().string_value
@@ -278,13 +298,9 @@ class IsaacMultitaskNode(Node):
 
     def _on_image(self, msg: Image) -> None:
         try:
-            if msg.encoding in ("bgr8", "8UC3"):
-                cv_img = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-            else:
-                cv_img = self._bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
-                cv_img = cv2.cvtColor(cv_img, cv2.COLOR_RGB2BGR)
+            cv_img = _imgmsg_to_bgr(msg)
         except Exception as e:  # noqa: BLE001
-            self.get_logger().error(f"cv_bridge failed: {e}")
+            self.get_logger().error(f"image decode failed: {e}")
             return
 
         vis = cv_img.copy()
@@ -340,9 +356,9 @@ class IsaacMultitaskNode(Node):
             _overlay_masks(vis, det, self._mcnn_thr, self._mcnn_class_names, self._mask_rng)
 
         try:
-            out_msg = self._bridge.cv2_to_imgmsg(vis, encoding="bgr8")
+            out_msg = _bgr_to_imgmsg(vis, encoding="bgr8")
         except Exception as e:  # noqa: BLE001
-            self.get_logger().error(f"cv2_to_imgmsg failed: {e}")
+            self.get_logger().error(f"image encode failed: {e}")
             return
         out_msg.header = msg.header
         self._pub_img.publish(out_msg)
