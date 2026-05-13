@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Use python3 from PATH (venv when activated) or VISION_BENCHMARK_PYTHON override.
+PYTHON="${VISION_BENCHMARK_PYTHON:-python3}"
+exec "$PYTHON" -m vision_benchmark_ros.isaac_multitask_node "$@"
