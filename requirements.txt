@@ -1,0 +1,30 @@
+# Vision-Based Spacecraft Docking - Offline Benchmarking
+# Install: pip install -r requirements.txt
+
+# Data & visualization
+numpy>=1.24
+pandas>=2.0
+matplotlib>=3.7
+opencv-python>=4.8
+
+# Deep learning (pose estimation)
+torch>=2.0
+torchvision>=0.15
+
+# Kalman filter & state estimation
+filterpy>=1.4
+scipy>=1.11
+
+# MPC (optional - for offline MPC design)
+cvxpy>=1.4
+
+# RL prep (for when Isaac Sim connects)
+gymnasium>=0.29
+
+# Jupyter
+jupyter>=1.0
+ipywidgets>=8.0
+tqdm>=4.0
+
+# NCSTP COCO detection (optional)
+pycocotools>=2.0.6
