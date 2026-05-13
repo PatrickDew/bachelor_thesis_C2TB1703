@@ -22,9 +22,14 @@ from std_msgs.msg import Float64MultiArray, String
 from cv_bridge import CvBridge
 
 
+def _param_type(value) -> int:
+    # Humble: ParameterValue.type_; Jazzy+: ParameterValue.type
+    return getattr(value, "type_", getattr(value, "type", 0))
+
+
 def _read_bool(node: Node, name: str) -> bool:
     v = node.get_parameter(name).get_parameter_value()
-    t = v.type_
+    t = _param_type(v)
     if t == ParameterType.PARAMETER_BOOL:
         return bool(v.bool_value)
     if t == ParameterType.PARAMETER_STRING:
@@ -37,7 +42,7 @@ def _read_bool(node: Node, name: str) -> bool:
 
 def _read_int(node: Node, name: str) -> int:
     v = node.get_parameter(name).get_parameter_value()
-    t = v.type_
+    t = _param_type(v)
     if t == ParameterType.PARAMETER_INTEGER:
         return int(v.integer_value)
     if t == ParameterType.PARAMETER_STRING:
@@ -47,7 +52,7 @@ def _read_int(node: Node, name: str) -> int:
 
 def _read_double(node: Node, name: str) -> float:
     v = node.get_parameter(name).get_parameter_value()
-    t = v.type_
+    t = _param_type(v)
     if t == ParameterType.PARAMETER_DOUBLE:
         return float(v.double_value)
     if t == ParameterType.PARAMETER_INTEGER:
