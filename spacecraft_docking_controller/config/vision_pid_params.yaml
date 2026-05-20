@@ -20,3 +20,6 @@ docking_controller_node:
     axis_invert_x: -1.0
     axis_invert_y: 1.0
     axis_invert_z: 1.0
+
+    log_vision_raw_pose: true
+    vision_raw_pose_topic: "/vision_benchmark/pose_xyz_quat"

@@ -56,6 +56,8 @@ docking_controller_node:
     
     # Data Logging (for plotting/analysis)
     enable_data_logging: true     # Log data to CSV file
+    log_vision_raw_pose: true     # Also log /vision_benchmark/pose_xyz_quat (raw, pre-bridge)
+    vision_raw_pose_topic: "/vision_benchmark/pose_xyz_quat"
     # Default on lab machine; override per PC or: export DOCKING_LOG_DIRECTORY=...
     log_directory: "/home/sichentao/Documents/spacecraft_docking_controller/logs"
     

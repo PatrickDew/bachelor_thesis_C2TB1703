@@ -49,7 +49,22 @@ from sdc_core.trajectory_generator import (
     ApproachType,
     DockingPhase
 )
-from sdc_core.log_paths import resolve_log_directory
+try:
+    from sdc_core.log_paths import resolve_log_directory
+except ImportError:
+    def resolve_log_directory(configured='', caller_file=None):
+        import os
+        env = os.environ.get('DOCKING_LOG_DIRECTORY', '').strip()
+        if env:
+            return os.path.abspath(os.path.expanduser(env))
+        if configured and str(configured).strip():
+            return os.path.abspath(os.path.expanduser(str(configured).strip()))
+        script_dir = os.path.dirname(os.path.realpath(caller_file or __file__))
+        if os.path.basename(os.path.dirname(script_dir)) == 'lib':
+            package_root = os.path.dirname(os.path.dirname(script_dir))
+        else:
+            package_root = os.path.dirname(script_dir)
+        return os.path.join(package_root, 'logs')
 
 
 class DockingControllerNode(Node):
@@ -133,6 +148,10 @@ class DockingControllerNode(Node):
         self.raw_pose = np.zeros(3)
         self.prev_raw_pose = None
         self.prev_raw_time = None
+
+        # Raw vision pose from isaac_multitask (logged alongside controller pose)
+        self.vision_raw_pose = np.array([np.nan, np.nan, np.nan])
+        self.has_vision_raw_pose = False
         
         # Smoothed velocity / force output for gradual approach
         self.smoothed_velocity_cmd = np.zeros(3)
@@ -176,6 +195,17 @@ class DockingControllerNode(Node):
             self.enable_callback,
             10
         )
+
+        if self.enable_data_logging and self.log_vision_raw_pose:
+            self.vision_pose_sub = self.create_subscription(
+                Float64MultiArray,
+                self.vision_raw_pose_topic,
+                self.vision_raw_pose_callback,
+                qos_profile,
+            )
+            self.get_logger().info(
+                f'Logging raw vision pose from: {self.vision_raw_pose_topic}'
+            )
         
         # Publishers
         self.wrench_pub = self.create_publisher(
@@ -300,6 +330,11 @@ class DockingControllerNode(Node):
             'log_directory',
             '/home/sichentao/Documents/spacecraft_docking_controller/logs',
         )
+        self.declare_parameter('log_vision_raw_pose', True)
+        self.declare_parameter(
+            'vision_raw_pose_topic',
+            '/vision_benchmark/pose_xyz_quat',
+        )
     
     def _get_parameters(self):
         """Get parameter values."""
@@ -349,6 +384,8 @@ class DockingControllerNode(Node):
         
         # Data logging
         self.enable_data_logging = self.get_parameter('enable_data_logging').value
+        self.log_vision_raw_pose = self.get_parameter('log_vision_raw_pose').value
+        self.vision_raw_pose_topic = self.get_parameter('vision_raw_pose_topic').value
         log_dir_param = self.get_parameter('log_directory').value
         self.log_directory = resolve_log_directory(log_dir_param, caller_file=__file__)
     
@@ -446,6 +483,17 @@ class DockingControllerNode(Node):
                 )
             else:
                 self.get_logger().warn('Pose measurement rejected by estimator')
+
+    def vision_raw_pose_callback(self, msg: Float64MultiArray):
+        """Cache latest isaac_multitask pose [x,y,z,q1..q4] for CSV logging."""
+        if len(msg.data) < 3:
+            return
+        self.vision_raw_pose = np.array([
+            float(msg.data[0]),
+            float(msg.data[1]),
+            float(msg.data[2]),
+        ])
+        self.has_vision_raw_pose = True
     
     def command_callback(self, msg: String):
         """Handle high-level docking commands."""
@@ -735,7 +783,8 @@ class DockingControllerNode(Node):
             self.log_file = open(self.log_file_path, 'w')
             # Write CSV header
             self.log_file.write(
-                'time,pos_x,pos_y,pos_z,range,range_rate,'
+                'time,raw_pos_x,raw_pos_y,raw_pos_z,'
+                'pos_x,pos_y,pos_z,range,range_rate,'
                 'ctrl_x,ctrl_y,ctrl_z,twist_x,twist_y,twist_z\n'
             )
             self.log_start_time = self.get_clock().now().nanoseconds / 1e9
@@ -750,8 +799,13 @@ class DockingControllerNode(Node):
             return
         try:
             t = self.get_clock().now().nanoseconds / 1e9 - self.log_start_time
+            if self.has_vision_raw_pose:
+                rp = self.vision_raw_pose
+            else:
+                rp = np.array([np.nan, np.nan, np.nan])
             self.log_file.write(
-                f'{t:.3f},{pos[0]:.4f},{pos[1]:.4f},{pos[2]:.4f},'
+                f'{t:.3f},{rp[0]:.4f},{rp[1]:.4f},{rp[2]:.4f},'
+                f'{pos[0]:.4f},{pos[1]:.4f},{pos[2]:.4f},'
                 f'{range_m:.4f},{range_rate:.4f},'
                 f'{control[0]:.6f},{control[1]:.6f},{control[2]:.6f},'
                 f'{twist[0]:.6f},{twist[1]:.6f},{twist[2]:.6f}\n'
