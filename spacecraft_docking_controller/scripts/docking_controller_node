@@ -49,6 +49,7 @@ from sdc_core.trajectory_generator import (
     ApproachType,
     DockingPhase
 )
+from sdc_core.log_paths import resolve_log_directory
 
 
 class DockingControllerNode(Node):
@@ -133,8 +134,9 @@ class DockingControllerNode(Node):
         self.prev_raw_pose = None
         self.prev_raw_time = None
         
-        # Smoothed velocity output for gradual approach
+        # Smoothed velocity / force output for gradual approach
         self.smoothed_velocity_cmd = np.zeros(3)
+        self.smoothed_force_cmd = np.zeros(3)
         
         # Reference trajectory
         self.reference_trajectory = None
@@ -232,6 +234,7 @@ class DockingControllerNode(Node):
         self.get_logger().info(f'Direct measurement mode: {self.use_direct_measurement}')
         self.get_logger().info(f'Max velocity command: {self.max_velocity_cmd} m/s')
         self.get_logger().info(f'Velocity smoothing: {self.velocity_smoothing}')
+        self.get_logger().info(f'Force smoothing: {self.force_smoothing}')
     
     def _declare_parameters(self):
         """Declare ROS2 parameters."""
@@ -289,10 +292,14 @@ class DockingControllerNode(Node):
         # Velocity limiting for smooth approach
         self.declare_parameter('max_velocity_cmd', 0.005)  # m/s
         self.declare_parameter('velocity_smoothing', 0.9)  # 0-1, higher=smoother
-        
+        self.declare_parameter('force_smoothing', 0.0)  # 0=off; 0.8-0.9 for vision+PID
+
         # Data logging for plotting
         self.declare_parameter('enable_data_logging', False)
-        self.declare_parameter('log_directory', '/home/sichentao/Documents/spacecraft_docking_controller/logs')
+        self.declare_parameter(
+            'log_directory',
+            '/home/sichentao/Documents/spacecraft_docking_controller/logs',
+        )
     
     def _get_parameters(self):
         """Get parameter values."""
@@ -338,10 +345,12 @@ class DockingControllerNode(Node):
         self.use_direct_measurement = self.get_parameter('use_direct_measurement').value
         self.max_velocity_cmd = self.get_parameter('max_velocity_cmd').value
         self.velocity_smoothing = self.get_parameter('velocity_smoothing').value
+        self.force_smoothing = self.get_parameter('force_smoothing').value
         
         # Data logging
         self.enable_data_logging = self.get_parameter('enable_data_logging').value
-        self.log_directory = self.get_parameter('log_directory').value
+        log_dir_param = self.get_parameter('log_directory').value
+        self.log_directory = resolve_log_directory(log_dir_param, caller_file=__file__)
     
     def _create_controller(self):
         """Create controller based on parameter."""
@@ -555,13 +564,23 @@ class DockingControllerNode(Node):
             throttle_duration_sec=1.0
         )
         
-        # Convert to force
-        control_force = control_accel * self.spacecraft_mass
-        
-        # Publish control commands
-        self._publish_wrench(control_force)
-        self._publish_twist(control_accel)
-        self._publish_isaac_force(control_force)
+        # Camera-frame PID output -> Isaac world frame (force was not remapped before)
+        control_isaac = self._remap_camera_to_isaac(control_accel)
+        control_force = control_isaac * self.spacecraft_mass
+        if self.force_smoothing > 0.0:
+            alpha_f = 1.0 - self.force_smoothing
+            self.smoothed_force_cmd = (
+                alpha_f * control_force
+                + self.force_smoothing * self.smoothed_force_cmd
+            )
+            force_out = self.smoothed_force_cmd
+        else:
+            force_out = control_force
+
+        # Publish control commands (Isaac frame)
+        self._publish_wrench(force_out)
+        self._publish_twist(control_isaac, in_isaac_frame=True)
+        self._publish_isaac_force(force_out)
         
         # Log data for plotting
         if self.enable_data_logging:
@@ -613,8 +632,22 @@ class DockingControllerNode(Node):
         else:
             self.current_phase = DockingPhase.TERMINAL
     
+    def _remap_camera_to_isaac(self, cam_cmd: np.ndarray) -> np.ndarray:
+        """Map camera/pose frame command to Isaac (X=fwd, Y=left, Z=up).
+
+        Camera (pose / URSO): X=right, Y=down, Z=forward (depth).
+        """
+        cam_x = float(cam_cmd[0])
+        cam_y = float(cam_cmd[1])
+        cam_z = float(cam_cmd[2])
+        return np.array([
+            cam_z * self.axis_invert_x,
+            -cam_x * self.axis_invert_y,
+            -cam_y * self.axis_invert_z,
+        ])
+
     def _publish_wrench(self, force: np.ndarray):
-        """Publish WrenchStamped for Isaac Sim."""
+        """Publish WrenchStamped for Isaac Sim (force already in Isaac frame)."""
         msg = WrenchStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.output_frame
@@ -630,34 +663,14 @@ class DockingControllerNode(Node):
         
         self.wrench_pub.publish(msg)
     
-    def _publish_twist(self, accel: np.ndarray):
-        """Publish velocity-level commands with limiting and smoothing.
-        
-        Coordinate frame mapping:
-        - FoundationPose camera frame: X=right, Y=down, Z=forward (depth)
-        - Isaac Sim Twist: X=forward, Y=left, Z=up
-        
-        So the mapping is:
-        - Twist X = Camera Z (forward)
-        - Twist Y = -Camera X (left = negative right)
-        - Twist Z = -Camera Y (up = negative down)
-        """
+    def _publish_twist(self, cmd: np.ndarray, in_isaac_frame: bool = False):
+        """Publish velocity-level commands with limiting and smoothing."""
         msg = Twist()
-        
-        # Control accel is in camera frame [cam_x, cam_y, cam_z]
-        cam_x = float(accel[0])  # Right direction in camera frame
-        cam_y = float(accel[1])  # Down direction in camera frame
-        cam_z = float(accel[2])  # Forward direction in camera frame
-        
-        # Remap to Isaac Sim Twist frame
-        # Twist X = forward (camera Z)
-        # Twist Y = left (negative camera X, since camera X is right)
-        # Twist Z = up (negative camera Y, since camera Y is down)
-        raw_cmd = np.array([
-            cam_z * self.axis_invert_x,   # Forward
-            -cam_x * self.axis_invert_y,  # Left (inverted right)
-            -cam_y * self.axis_invert_z   # Up (inverted down)
-        ])
+
+        if in_isaac_frame:
+            raw_cmd = np.asarray(cmd, dtype=float).copy()
+        else:
+            raw_cmd = self._remap_camera_to_isaac(cmd)
         
         # Limit velocity magnitude (for slow approach)
         cmd_magnitude = np.linalg.norm(raw_cmd)
@@ -691,6 +704,8 @@ class DockingControllerNode(Node):
     def _publish_zero_control(self):
         """Publish zero control commands."""
         zero_force = np.zeros(3)
+        self.smoothed_force_cmd = zero_force.copy()
+        self.smoothed_velocity_cmd = zero_force.copy()
         self._publish_wrench(zero_force)
         self._publish_twist(np.zeros(3))
         self._publish_isaac_force(zero_force)

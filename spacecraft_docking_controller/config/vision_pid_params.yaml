@@ -1,0 +1,22 @@
+# PID tuning overlay for isaac_multitask vision pose (used by isaac_vision_docking.launch.py)
+# FoundationPose was smoother; these settings reduce stepped force commands with noisy vision.
+
+docking_controller_node:
+  ros__parameters:
+    controller_type: "PID"
+    control_rate: 30.0
+    velocity_smoothing: 0.88
+    force_smoothing: 0.85
+
+    pid_kp: [0.001, 0.001, 0.001]
+    pid_ki: [0.00005, 0.00005, 0.00005]
+    pid_kd: [0.02, 0.02, 0.02]
+    pid_kv: [0.0, 0.0, 0.0]
+
+    max_velocity_cmd: 0.004
+    max_force: 25.0
+
+    # Isaac X = forward (camera Z). Flip if chaser moves away along +X.
+    axis_invert_x: -1.0
+    axis_invert_y: 1.0
+    axis_invert_z: 1.0

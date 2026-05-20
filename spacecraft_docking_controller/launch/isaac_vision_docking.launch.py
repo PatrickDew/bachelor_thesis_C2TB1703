@@ -21,11 +21,12 @@ def generate_launch_description():
     pkg_share = get_package_share_directory('spacecraft_docking_controller')
     bridge_config = os.path.join(pkg_share, 'config', 'pose_bridge_params.yaml')
     docking_config = os.path.join(pkg_share, 'config', 'docking_params.yaml')
+    vision_pid_config = os.path.join(pkg_share, 'config', 'vision_pid_params.yaml')
 
     controller_arg = DeclareLaunchArgument(
         'controller',
         default_value='PID',
-        description='PID recommended for frame tuning; LQR or MPC after calibration',
+        description='Controller type (thesis stack uses PID + vision_pid_params.yaml)',
     )
     pose_input_arg = DeclareLaunchArgument(
         'pose_input_topic',
@@ -57,6 +58,7 @@ def generate_launch_description():
         output='screen',
         parameters=[
             docking_config,
+            vision_pid_config,
             {
                 'controller_type': LaunchConfiguration('controller'),
                 'pose_topic': LaunchConfiguration('pose_output_topic'),

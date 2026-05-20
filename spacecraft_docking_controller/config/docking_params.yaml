@@ -51,11 +51,12 @@ docking_controller_node:
     
     # Velocity Limiting (for smooth approach)
     max_velocity_cmd: 0.005       # Maximum 0.5 cm/s (VERY SLOW for docking)
-    velocity_smoothing: 0.7       # Higher smoothing for smoother motion
+    velocity_smoothing: 0.7       # Twist smoothing (0-1, higher=smoother)
+    force_smoothing: 0.0          # Isaac force smoothing; vision stack uses vision_pid_params.yaml
     
     # Data Logging (for plotting/analysis)
     enable_data_logging: true     # Log data to CSV file
-    # Logs are saved to ~/Documents/spacecraft_docking_controller/logs/ with timestamp
+    # Default on lab machine; override per PC or: export DOCKING_LOG_DIRECTORY=...
     log_directory: "/home/sichentao/Documents/spacecraft_docking_controller/logs"
     
     # Docking Approach Parameters
@@ -70,10 +71,10 @@ docking_controller_node:
     #   Twist Y = -Camera X (left)
     #   Twist Z = -Camera Y (up)
     #
-    # These scale factors allow fine-tuning if needed (use -1.0 to invert)
-    axis_invert_x: 1.0     # Twist X (forward direction)
-    axis_invert_y: 1.0     # Twist Y (left/right direction)
-    axis_invert_z: 1.0     # Twist Z (up/down direction)
+    # Isaac remap: X=fwd<-cam_Z, Y=left<- -cam_X, Z=up<- -cam_Y. Use -1.0 to flip.
+    axis_invert_x: 1.0
+    axis_invert_y: 1.0
+    axis_invert_z: 1.0
 
 
 # Aggressive Controller Settings (for testing)
