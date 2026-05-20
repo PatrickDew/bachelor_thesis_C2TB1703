@@ -1,0 +1,851 @@
+#!/usr/bin/env python3
+"""
+ROS2 Docking Controller Node
+
+Main control node for spacecraft docking operations.
+Subscribes to pose estimation and publishes control commands.
+
+Features:
+- Multiple controller support (PID, LQR, MPC)
+- Real-time state estimation
+- Trajectory tracking
+- Safety monitoring
+- Isaac Sim integration via Wrench/Twist messages
+
+Author: Sichen Tao
+"""
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from geometry_msgs.msg import PoseStamped, Pose, Twist, Wrench, WrenchStamped
+from geometry_msgs.msg import Vector3, Quaternion, Point
+from std_msgs.msg import Header, Bool, String, Float64MultiArray
+from nav_msgs.msg import Odometry
+from visualization_msgs.msg import Marker, MarkerArray
+import numpy as np
+from typing import Optional
+import time
+
+# Import package modules
+from sdc_core.dynamics import (
+    ClohessyWiltshireDynamics, 
+    OrbitalParameters,
+    SpacecraftDynamics
+)
+from sdc_core.controllers import (
+    PIDController, 
+    LQRController, 
+    MPCController,
+    ControlLimits,
+    create_controller
+)
+from sdc_core.state_estimator import (
+    StateEstimator, 
+    EstimatorConfig
+)
+from sdc_core.trajectory_generator import (
+    TrajectoryGenerator,
+    ApproachType,
+    DockingPhase
+)
+
+
+class DockingControllerNode(Node):
+    """
+    Main ROS2 node for spacecraft docking control.
+    
+    Subscribes to:
+    - /pose_estimation/object_pose (PoseStamped): Target pose from FoundationPose
+    - /docking/command (String): High-level commands (start, stop, abort)
+    
+    Publishes to:
+    - /docking/control_wrench (WrenchStamped): Force/torque commands for Isaac Sim
+    - /docking/control_twist (Twist): Velocity commands (alternative control mode)
+    - /docking/status (String): Docking status
+    - /docking/state (Float64MultiArray): Full state estimate
+    - /docking/visualization (MarkerArray): RViz visualization
+    """
+    
+    def __init__(self):
+        super().__init__('docking_controller_node')
+        
+        # Declare parameters
+        self._declare_parameters()
+        
+        # Get parameters
+        self._get_parameters()
+        
+        # Initialize dynamics model
+        orbital_params = OrbitalParameters(
+            semi_major_axis=self.orbital_altitude + 6.371e6,  # Earth radius + altitude
+        )
+        self.dynamics = ClohessyWiltshireDynamics(
+            orbital_params=orbital_params,
+            spacecraft_mass=self.spacecraft_mass
+        )
+        
+        # Initialize control limits
+        self.control_limits = ControlLimits(
+            max_force=self.max_force,
+            max_torque=self.max_torque,
+            max_acceleration=self.max_force / self.spacecraft_mass
+        )
+        
+        # Initialize controller
+        self.controller = self._create_controller()
+        self.controller.dt = 1.0 / self.control_rate
+        
+        # Initialize state estimator
+        estimator_config = EstimatorConfig(
+            r_position=self.pose_noise,
+            r_attitude=self.attitude_noise,
+            outlier_threshold=self.outlier_threshold if not self.disable_outlier_rejection else float('inf')
+        )
+        self.state_estimator = StateEstimator(
+            config=estimator_config,
+            dynamics=self.dynamics
+        )
+        
+        if self.disable_outlier_rejection:
+            self.get_logger().info('Outlier rejection DISABLED')
+        else:
+            self.get_logger().info(f'Outlier threshold: {self.outlier_threshold}')
+        
+        # Initialize trajectory generator
+        approach_type = ApproachType.V_BAR if self.approach_type == 'v_bar' else ApproachType.R_BAR
+        self.trajectory_generator = TrajectoryGenerator(
+            dynamics=self.dynamics,
+            approach_type=approach_type
+        )
+        
+        # State variables
+        self.current_state = np.zeros(6)  # [x, y, z, vx, vy, vz]
+        # Target is docking port at origin (0,0,0) with zero velocity
+        self.target_state = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        self.is_docking_active = False
+        self.current_phase = DockingPhase.HOLD
+        self.last_pose_time = None
+        self.control_enabled = False
+        
+        # Direct measurement mode - track raw pose
+        self.raw_pose = np.zeros(3)
+        self.prev_raw_pose = None
+        self.prev_raw_time = None
+        
+        # Smoothed velocity output for gradual approach
+        self.smoothed_velocity_cmd = np.zeros(3)
+        
+        # Reference trajectory
+        self.reference_trajectory = None
+        self.trajectory_index = 0
+        
+        # Data logging for plotting
+        self.log_file = None
+        self.log_start_time = None
+        if self.enable_data_logging:
+            self._init_data_logger()
+        
+        # QoS profile for reliable communication
+        qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+        
+        # Subscribers
+        self.pose_sub = self.create_subscription(
+            PoseStamped,
+            self.pose_topic,
+            self.pose_callback,
+            qos_profile
+        )
+        
+        self.command_sub = self.create_subscription(
+            String,
+            '/docking/command',
+            self.command_callback,
+            10
+        )
+        
+        self.enable_sub = self.create_subscription(
+            Bool,
+            '/docking/enable',
+            self.enable_callback,
+            10
+        )
+        
+        # Publishers
+        self.wrench_pub = self.create_publisher(
+            WrenchStamped,
+            '/docking/control_wrench',
+            10
+        )
+        
+        self.twist_pub = self.create_publisher(
+            Twist,
+            '/docking/control_twist',
+            10
+        )
+        
+        self.status_pub = self.create_publisher(
+            String,
+            '/docking/status',
+            10
+        )
+        
+        self.state_pub = self.create_publisher(
+            Float64MultiArray,
+            '/docking/state',
+            10
+        )
+        
+        self.marker_pub = self.create_publisher(
+            MarkerArray,
+            '/docking/visualization',
+            10
+        )
+        
+        # For Isaac Sim: Publish to articulation controller topic
+        self.isaac_force_pub = self.create_publisher(
+            Float64MultiArray,
+            '/spacecraft/force_command',
+            10
+        )
+        
+        # Control timer
+        self.control_timer = self.create_timer(
+            1.0 / self.control_rate,
+            self.control_loop
+        )
+        
+        # Status timer (slower rate)
+        self.status_timer = self.create_timer(
+            1.0,
+            self.publish_status
+        )
+        
+        self.get_logger().info(f'Docking Controller initialized')
+        self.get_logger().info(f'Controller type: {self.controller_type}')
+        self.get_logger().info(f'Subscribing to pose: {self.pose_topic}')
+        self.get_logger().info(f'Control rate: {self.control_rate} Hz')
+        self.get_logger().info(f'Direct measurement mode: {self.use_direct_measurement}')
+        self.get_logger().info(f'Max velocity command: {self.max_velocity_cmd} m/s')
+        self.get_logger().info(f'Velocity smoothing: {self.velocity_smoothing}')
+    
+    def _declare_parameters(self):
+        """Declare ROS2 parameters."""
+        # Topics
+        self.declare_parameter('pose_topic', '/pose_estimation/object_pose')
+        self.declare_parameter('output_frame', 'lvlh_frame')
+        
+        # Spacecraft parameters
+        self.declare_parameter('spacecraft_mass', 500.0)  # kg
+        self.declare_parameter('orbital_altitude', 400e3)  # m (ISS altitude)
+        
+        # Control parameters
+        self.declare_parameter('controller_type', 'LQR')  # PID, LQR, MPC
+        self.declare_parameter('control_rate', 10.0)  # Hz
+        self.declare_parameter('max_force', 50.0)  # N
+        self.declare_parameter('max_torque', 5.0)  # N*m
+        
+        # PID gains (if using PID) - Adaptive PID with Range-Rate Control
+        self.declare_parameter('pid_kp', [0.01, 0.01, 0.01])
+        self.declare_parameter('pid_ki', [0.001, 0.001, 0.001])
+        self.declare_parameter('pid_kd', [0.1, 0.1, 0.1])
+        self.declare_parameter('pid_kv', [0.1, 0.1, 0.1])  # Range rate control gains
+        
+        # CW Feedforward (set false for stationary ISS, true for orbital environment)
+        self.declare_parameter('use_cw_feedforward', False)
+        
+        # LQR weights (if using LQR)
+        self.declare_parameter('lqr_q_pos', 100.0)
+        self.declare_parameter('lqr_q_vel', 10.0)
+        self.declare_parameter('lqr_r', 1.0)
+        
+        # MPC parameters (if using MPC)
+        self.declare_parameter('mpc_horizon', 20)
+        
+        # Estimator parameters
+        self.declare_parameter('pose_noise', 0.01)
+        self.declare_parameter('attitude_noise', 0.001)
+        self.declare_parameter('outlier_threshold', 1000.0)  # High default for space scenarios
+        self.declare_parameter('disable_outlier_rejection', False)
+        
+        # Docking parameters
+        self.declare_parameter('approach_type', 'v_bar')
+        self.declare_parameter('initial_standoff', 50.0)  # m
+        self.declare_parameter('final_standoff', 0.5)  # m
+        self.declare_parameter('approach_velocity', -0.1)  # m/s
+        
+        # Axis inversion for coordinate frame mapping
+        self.declare_parameter('axis_invert_x', 1.0)
+        self.declare_parameter('axis_invert_y', 1.0)
+        self.declare_parameter('axis_invert_z', -1.0)
+        
+        # Direct measurement mode (bypass EKF drift)
+        self.declare_parameter('use_direct_measurement', True)
+        
+        # Velocity limiting for smooth approach
+        self.declare_parameter('max_velocity_cmd', 0.005)  # m/s
+        self.declare_parameter('velocity_smoothing', 0.9)  # 0-1, higher=smoother
+        
+        # Data logging for plotting
+        self.declare_parameter('enable_data_logging', False)
+        self.declare_parameter('log_directory', '/home/sichentao/Documents/spacecraft_docking_controller/logs')
+    
+    def _get_parameters(self):
+        """Get parameter values."""
+        self.pose_topic = self.get_parameter('pose_topic').value
+        self.output_frame = self.get_parameter('output_frame').value
+        
+        self.spacecraft_mass = self.get_parameter('spacecraft_mass').value
+        self.orbital_altitude = self.get_parameter('orbital_altitude').value
+        
+        self.controller_type = self.get_parameter('controller_type').value
+        self.control_rate = self.get_parameter('control_rate').value
+        self.max_force = self.get_parameter('max_force').value
+        self.max_torque = self.get_parameter('max_torque').value
+        
+        self.pid_kp = self.get_parameter('pid_kp').value
+        self.pid_ki = self.get_parameter('pid_ki').value
+        self.pid_kd = self.get_parameter('pid_kd').value
+        self.pid_kv = self.get_parameter('pid_kv').value
+        self.use_cw_feedforward = self.get_parameter('use_cw_feedforward').value
+        
+        self.lqr_q_pos = self.get_parameter('lqr_q_pos').value
+        self.lqr_q_vel = self.get_parameter('lqr_q_vel').value
+        self.lqr_r = self.get_parameter('lqr_r').value
+        
+        self.mpc_horizon = self.get_parameter('mpc_horizon').value
+        
+        self.pose_noise = self.get_parameter('pose_noise').value
+        self.attitude_noise = self.get_parameter('attitude_noise').value
+        self.outlier_threshold = self.get_parameter('outlier_threshold').value
+        self.disable_outlier_rejection = self.get_parameter('disable_outlier_rejection').value
+        
+        self.approach_type = self.get_parameter('approach_type').value
+        self.initial_standoff = self.get_parameter('initial_standoff').value
+        self.final_standoff = self.get_parameter('final_standoff').value
+        self.approach_velocity = self.get_parameter('approach_velocity').value
+        
+        # Axis inversion
+        self.axis_invert_x = self.get_parameter('axis_invert_x').value
+        self.axis_invert_y = self.get_parameter('axis_invert_y').value
+        self.axis_invert_z = self.get_parameter('axis_invert_z').value
+        
+        # Direct measurement mode and velocity limits
+        self.use_direct_measurement = self.get_parameter('use_direct_measurement').value
+        self.max_velocity_cmd = self.get_parameter('max_velocity_cmd').value
+        self.velocity_smoothing = self.get_parameter('velocity_smoothing').value
+        
+        # Data logging
+        self.enable_data_logging = self.get_parameter('enable_data_logging').value
+        self.log_directory = self.get_parameter('log_directory').value
+    
+    def _create_controller(self):
+        """Create controller based on parameter."""
+        controller = create_controller(
+            self.controller_type,
+            self.dynamics,
+            self.control_limits
+        )
+        
+        # Set specific gains based on controller type
+        if self.controller_type == 'PID':
+            controller.set_gains(
+                np.array(self.pid_kp),
+                np.array(self.pid_ki),
+                np.array(self.pid_kd)
+            )
+            # Set range rate control gain
+            controller.kv = np.array(self.pid_kv)
+            # Set CW feedforward mode (false for stationary ISS)
+            controller.use_cw_feedforward = self.use_cw_feedforward
+            mode = "ORBITAL (CW feedforward ON)" if self.use_cw_feedforward else "STATIONARY (simple PID)"
+            self.get_logger().info(f'PID mode: {mode}')
+        elif self.controller_type == 'LQR':
+            Q = np.diag([self.lqr_q_pos] * 3 + [self.lqr_q_vel] * 3)
+            R = np.diag([self.lqr_r] * 3)
+            controller.set_weights(Q, R)
+        elif self.controller_type == 'MPC':
+            controller.horizon = self.mpc_horizon
+        
+        return controller
+    
+    def pose_callback(self, msg: PoseStamped):
+        """Process incoming pose estimation."""
+        # Extract position
+        position = np.array([
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z
+        ])
+        
+        # Extract quaternion
+        quaternion = np.array([
+            msg.pose.orientation.w,
+            msg.pose.orientation.x,
+            msg.pose.orientation.y,
+            msg.pose.orientation.z
+        ])
+        
+        # Get timestamp
+        timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        current_time = self.get_clock().now().nanoseconds / 1e9
+        
+        if self.use_direct_measurement:
+            # DIRECT MEASUREMENT MODE: Use raw pose directly (no EKF drift)
+            self.raw_pose = position.copy()
+            
+            # Estimate velocity from finite differences
+            velocity = np.zeros(3)
+            if self.prev_raw_pose is not None and self.prev_raw_time is not None:
+                dt = current_time - self.prev_raw_time
+                if dt > 0.001:
+                    velocity = (position - self.prev_raw_pose) / dt
+            
+            # Update state directly from raw measurements
+            self.current_state[0:3] = position
+            self.current_state[3:6] = velocity
+            
+            # Store for next iteration
+            self.prev_raw_pose = position.copy()
+            self.prev_raw_time = current_time
+            self.last_pose_time = current_time
+            
+            # Log received pose
+            self.get_logger().info(
+                f'DIRECT: Pose: [{position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}]',
+                throttle_duration_sec=1.0
+            )
+        else:
+            # EKF MODE: Use state estimator
+            accepted = self.state_estimator.update(
+                position, quaternion, timestamp, confidence=0.8
+            )
+            
+            if accepted:
+                self.current_state = self.state_estimator.get_translational_state()
+                self.last_pose_time = current_time
+                
+                # Log received pose for debugging
+                self.get_logger().info(
+                    f'EKF: Pose: [{position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}] → '
+                    f'State: [{self.current_state[0]:.3f}, {self.current_state[1]:.3f}, {self.current_state[2]:.3f}]',
+                    throttle_duration_sec=1.0
+                )
+            else:
+                self.get_logger().warn('Pose measurement rejected by estimator')
+    
+    def command_callback(self, msg: String):
+        """Handle high-level docking commands."""
+        command = msg.data.lower()
+        
+        if command == 'start':
+            self.start_docking()
+        elif command == 'stop':
+            self.stop_docking()
+        elif command == 'abort':
+            self.abort_docking()
+        elif command == 'hold':
+            self.hold_position()
+        elif command == 'approach':
+            self.continue_approach()
+        else:
+            self.get_logger().warn(f'Unknown command: {command}')
+    
+    def enable_callback(self, msg: Bool):
+        """Enable/disable control output."""
+        self.control_enabled = msg.data
+        self.get_logger().info(f'Control {"enabled" if self.control_enabled else "disabled"}')
+    
+    def start_docking(self):
+        """Start docking sequence."""
+        self.is_docking_active = True
+        self.control_enabled = True
+        self.current_phase = DockingPhase.FAR_RANGE
+        
+        # Generate approach trajectory
+        self.reference_trajectory = self.trajectory_generator.generate_v_bar_approach(
+            self.current_state[0:3],
+            final_range=self.final_standoff
+        )
+        self.trajectory_index = 0
+        
+        self.get_logger().info('Docking sequence started')
+    
+    def stop_docking(self):
+        """Stop docking (controlled stop)."""
+        self.is_docking_active = False
+        self.target_state = self.current_state.copy()
+        self.target_state[3:6] = 0.0  # Zero velocity target
+        
+        self.get_logger().info('Docking stopped - holding position')
+    
+    def abort_docking(self):
+        """Abort docking (emergency stop)."""
+        self.is_docking_active = False
+        self.control_enabled = False
+        self.current_phase = DockingPhase.HOLD
+        
+        # Publish zero commands
+        self._publish_zero_control()
+        
+        self.get_logger().warn('DOCKING ABORTED')
+    
+    def hold_position(self):
+        """Hold current position."""
+        self.target_state = self.current_state.copy()
+        self.target_state[3:6] = 0.0
+        self.current_phase = DockingPhase.HOLD
+        
+        self.get_logger().info('Holding position')
+    
+    def continue_approach(self):
+        """Continue approach from current position."""
+        if self.reference_trajectory is not None:
+            self.is_docking_active = True
+            self.get_logger().info('Continuing approach')
+    
+    def control_loop(self):
+        """Main control loop - runs at control_rate Hz."""
+        if not self.control_enabled:
+            return
+        
+        # Check if we have valid pose data (received recently)
+        if self.last_pose_time is None:
+            self.get_logger().warn('No pose data received yet - waiting...', throttle_duration_sec=2.0)
+            self._publish_zero_control()
+            return
+        
+        # Check if pose is stale (older than 1 second)
+        current_time = self.get_clock().now().nanoseconds / 1e9
+        pose_age = current_time - self.last_pose_time
+        if pose_age > 1.0:
+            self.get_logger().warn(f'Pose data stale ({pose_age:.1f}s old) - stopping', throttle_duration_sec=2.0)
+            self._publish_zero_control()
+            return
+        
+        # Update target based on trajectory
+        if self.is_docking_active and self.reference_trajectory is not None:
+            self._update_target_from_trajectory()
+        
+        # Compute control
+        control_accel = self.controller.compute_control(
+            self.current_state,
+            self.target_state
+        )
+        
+        # Log control computation with range and range rate
+        pos_error = self.current_state[0:3] - self.target_state[0:3]
+        vel = self.current_state[3:6]
+        distance = np.linalg.norm(pos_error)
+        
+        # Compute range rate (closing velocity)
+        if distance > 0.001:
+            range_dir = pos_error / distance
+            range_rate = np.dot(vel, range_dir)  # Negative = approaching
+        else:
+            range_rate = 0.0
+        
+        self.get_logger().info(
+            f'Range: {distance:.3f}m | Rate: {range_rate*100:.2f}cm/s | '
+            f'Pos: [{self.current_state[0]:.2f}, {self.current_state[1]:.2f}, {self.current_state[2]:.2f}]',
+            throttle_duration_sec=1.0
+        )
+        
+        # Convert to force
+        control_force = control_accel * self.spacecraft_mass
+        
+        # Publish control commands
+        self._publish_wrench(control_force)
+        self._publish_twist(control_accel)
+        self._publish_isaac_force(control_force)
+        
+        # Log data for plotting
+        if self.enable_data_logging:
+            self._log_data(
+                self.current_state[0:3],
+                distance,
+                range_rate,
+                control_accel,
+                self.smoothed_velocity_cmd
+            )
+        
+        # Publish state
+        self._publish_state()
+        
+        # Update phase based on range
+        self._update_phase()
+        
+        # Publish visualization
+        self._publish_visualization()
+    
+    def _update_target_from_trajectory(self):
+        """Update target state from reference trajectory."""
+        if self.trajectory_index < len(self.reference_trajectory):
+            waypoint = self.reference_trajectory[self.trajectory_index]
+            self.target_state[0:3] = waypoint.position
+            self.target_state[3:6] = waypoint.velocity
+            
+            # Check if reached waypoint
+            pos_error = np.linalg.norm(self.current_state[0:3] - waypoint.position)
+            vel_error = np.linalg.norm(self.current_state[3:6] - waypoint.velocity)
+            
+            if pos_error < 0.5 and vel_error < 0.05:  # Within tolerance
+                self.trajectory_index += 1
+                self.get_logger().info(
+                    f'Waypoint {self.trajectory_index} reached, '
+                    f'{len(self.reference_trajectory) - self.trajectory_index} remaining'
+                )
+    
+    def _update_phase(self):
+        """Update docking phase based on range."""
+        range_m = np.linalg.norm(self.current_state[0:3])
+        
+        if range_m > 100.0:
+            self.current_phase = DockingPhase.FAR_RANGE
+        elif range_m > 10.0:
+            self.current_phase = DockingPhase.MID_RANGE
+        elif range_m > 1.0:
+            self.current_phase = DockingPhase.CLOSE_RANGE
+        else:
+            self.current_phase = DockingPhase.TERMINAL
+    
+    def _publish_wrench(self, force: np.ndarray):
+        """Publish WrenchStamped for Isaac Sim."""
+        msg = WrenchStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.output_frame
+        
+        msg.wrench.force.x = float(force[0])
+        msg.wrench.force.y = float(force[1])
+        msg.wrench.force.z = float(force[2])
+        
+        # Torque (attitude control - simplified)
+        msg.wrench.torque.x = 0.0
+        msg.wrench.torque.y = 0.0
+        msg.wrench.torque.z = 0.0
+        
+        self.wrench_pub.publish(msg)
+    
+    def _publish_twist(self, accel: np.ndarray):
+        """Publish velocity-level commands with limiting and smoothing.
+        
+        Coordinate frame mapping:
+        - FoundationPose camera frame: X=right, Y=down, Z=forward (depth)
+        - Isaac Sim Twist: X=forward, Y=left, Z=up
+        
+        So the mapping is:
+        - Twist X = Camera Z (forward)
+        - Twist Y = -Camera X (left = negative right)
+        - Twist Z = -Camera Y (up = negative down)
+        """
+        msg = Twist()
+        
+        # Control accel is in camera frame [cam_x, cam_y, cam_z]
+        cam_x = float(accel[0])  # Right direction in camera frame
+        cam_y = float(accel[1])  # Down direction in camera frame
+        cam_z = float(accel[2])  # Forward direction in camera frame
+        
+        # Remap to Isaac Sim Twist frame
+        # Twist X = forward (camera Z)
+        # Twist Y = left (negative camera X, since camera X is right)
+        # Twist Z = up (negative camera Y, since camera Y is down)
+        raw_cmd = np.array([
+            cam_z * self.axis_invert_x,   # Forward
+            -cam_x * self.axis_invert_y,  # Left (inverted right)
+            -cam_y * self.axis_invert_z   # Up (inverted down)
+        ])
+        
+        # Limit velocity magnitude (for slow approach)
+        cmd_magnitude = np.linalg.norm(raw_cmd)
+        if cmd_magnitude > self.max_velocity_cmd:
+            raw_cmd = raw_cmd * (self.max_velocity_cmd / cmd_magnitude)
+        
+        # Apply exponential smoothing for gradual, continuous movement
+        alpha = 1.0 - self.velocity_smoothing
+        self.smoothed_velocity_cmd = (alpha * raw_cmd + 
+                                       self.velocity_smoothing * self.smoothed_velocity_cmd)
+        
+        # Use smoothed command
+        msg.linear.x = float(self.smoothed_velocity_cmd[0])
+        msg.linear.y = float(self.smoothed_velocity_cmd[1])
+        msg.linear.z = float(self.smoothed_velocity_cmd[2])
+        
+        # Log actual published velocity for debugging
+        self.get_logger().info(
+            f'Twist: [{msg.linear.x:.5f}, {msg.linear.y:.5f}, {msg.linear.z:.5f}]',
+            throttle_duration_sec=1.0
+        )
+        
+        self.twist_pub.publish(msg)
+    
+    def _publish_isaac_force(self, force: np.ndarray):
+        """Publish force command for Isaac Sim articulation controller."""
+        msg = Float64MultiArray()
+        msg.data = [float(force[0]), float(force[1]), float(force[2])]
+        self.isaac_force_pub.publish(msg)
+    
+    def _publish_zero_control(self):
+        """Publish zero control commands."""
+        zero_force = np.zeros(3)
+        self._publish_wrench(zero_force)
+        self._publish_twist(np.zeros(3))
+        self._publish_isaac_force(zero_force)
+    
+    def _publish_state(self):
+        """Publish full state estimate."""
+        msg = Float64MultiArray()
+        msg.data = self.current_state.tolist()
+        self.state_pub.publish(msg)
+    
+    def _init_data_logger(self):
+        """Initialize CSV data logger for plotting with timestamped filename."""
+        import os
+        from datetime import datetime
+        
+        try:
+            # Create log directory if it doesn't exist
+            os.makedirs(self.log_directory, exist_ok=True)
+            
+            # Create timestamped filename
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            self.log_file_path = os.path.join(
+                self.log_directory, 
+                f'docking_{timestamp}.csv'
+            )
+            
+            self.log_file = open(self.log_file_path, 'w')
+            # Write CSV header
+            self.log_file.write(
+                'time,pos_x,pos_y,pos_z,range,range_rate,'
+                'ctrl_x,ctrl_y,ctrl_z,twist_x,twist_y,twist_z\n'
+            )
+            self.log_start_time = self.get_clock().now().nanoseconds / 1e9
+            self.get_logger().info(f'Data logging enabled: {self.log_file_path}')
+        except Exception as e:
+            self.get_logger().error(f'Failed to initialize data logger: {e}')
+            self.enable_data_logging = False
+    
+    def _log_data(self, pos, range_m, range_rate, control, twist):
+        """Log data point to CSV file."""
+        if not self.enable_data_logging or self.log_file is None:
+            return
+        try:
+            t = self.get_clock().now().nanoseconds / 1e9 - self.log_start_time
+            self.log_file.write(
+                f'{t:.3f},{pos[0]:.4f},{pos[1]:.4f},{pos[2]:.4f},'
+                f'{range_m:.4f},{range_rate:.4f},'
+                f'{control[0]:.6f},{control[1]:.6f},{control[2]:.6f},'
+                f'{twist[0]:.6f},{twist[1]:.6f},{twist[2]:.6f}\n'
+            )
+            self.log_file.flush()  # Ensure data is written
+        except Exception as e:
+            self.get_logger().warn(f'Failed to log data: {e}')
+    
+    def publish_status(self):
+        """Publish docking status (periodic)."""
+        range_m = np.linalg.norm(self.current_state[0:3])
+        range_rate = np.dot(self.current_state[0:3], self.current_state[3:6]) / max(range_m, 0.01)
+        
+        status = (
+            f"Phase: {self.current_phase.value} | "
+            f"Range: {range_m:.2f}m | "
+            f"Rate: {range_rate:.3f}m/s | "
+            f"Controller: {self.controller_type} | "
+            f"Active: {self.is_docking_active}"
+        )
+        
+        msg = String()
+        msg.data = status
+        self.status_pub.publish(msg)
+    
+    def _publish_visualization(self):
+        """Publish RViz visualization markers."""
+        markers = MarkerArray()
+        
+        # Current position marker
+        pos_marker = Marker()
+        pos_marker.header.frame_id = self.output_frame
+        pos_marker.header.stamp = self.get_clock().now().to_msg()
+        pos_marker.ns = "docking"
+        pos_marker.id = 0
+        pos_marker.type = Marker.SPHERE
+        pos_marker.action = Marker.ADD
+        pos_marker.pose.position.x = self.current_state[0]
+        pos_marker.pose.position.y = self.current_state[1]
+        pos_marker.pose.position.z = self.current_state[2]
+        pos_marker.scale.x = 0.5
+        pos_marker.scale.y = 0.5
+        pos_marker.scale.z = 0.5
+        pos_marker.color.r = 0.0
+        pos_marker.color.g = 1.0
+        pos_marker.color.b = 0.0
+        pos_marker.color.a = 0.8
+        markers.markers.append(pos_marker)
+        
+        # Target position marker
+        target_marker = Marker()
+        target_marker.header.frame_id = self.output_frame
+        target_marker.header.stamp = self.get_clock().now().to_msg()
+        target_marker.ns = "docking"
+        target_marker.id = 1
+        target_marker.type = Marker.SPHERE
+        target_marker.action = Marker.ADD
+        target_marker.pose.position.x = self.target_state[0]
+        target_marker.pose.position.y = self.target_state[1]
+        target_marker.pose.position.z = self.target_state[2]
+        target_marker.scale.x = 0.3
+        target_marker.scale.y = 0.3
+        target_marker.scale.z = 0.3
+        target_marker.color.r = 1.0
+        target_marker.color.g = 0.0
+        target_marker.color.b = 0.0
+        target_marker.color.a = 0.8
+        markers.markers.append(target_marker)
+        
+        # Velocity vector
+        vel_marker = Marker()
+        vel_marker.header.frame_id = self.output_frame
+        vel_marker.header.stamp = self.get_clock().now().to_msg()
+        vel_marker.ns = "docking"
+        vel_marker.id = 2
+        vel_marker.type = Marker.ARROW
+        vel_marker.action = Marker.ADD
+        vel_marker.points = [
+            Point(x=self.current_state[0], y=self.current_state[1], z=self.current_state[2]),
+            Point(
+                x=self.current_state[0] + self.current_state[3] * 10,
+                y=self.current_state[1] + self.current_state[4] * 10,
+                z=self.current_state[2] + self.current_state[5] * 10
+            )
+        ]
+        vel_marker.scale.x = 0.1
+        vel_marker.scale.y = 0.2
+        vel_marker.color.r = 0.0
+        vel_marker.color.g = 0.0
+        vel_marker.color.b = 1.0
+        vel_marker.color.a = 0.8
+        markers.markers.append(vel_marker)
+        
+        self.marker_pub.publish(markers)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DockingControllerNode()
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+

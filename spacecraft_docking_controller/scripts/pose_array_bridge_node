@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""
+Bridge vision_benchmark pose output to docking controller PoseStamped input.
+
+Subscribes: std_msgs/Float64MultiArray [x, y, z, q1, q2, q3, q4] (URSO / thesis format)
+Publishes: geometry_msgs/PoseStamped (q4 = scalar per URSO JPL convention)
+"""
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from std_msgs.msg import Float64MultiArray
+from geometry_msgs.msg import PoseStamped
+
+
+class PoseArrayBridgeNode(Node):
+    def __init__(self):
+        super().__init__('pose_array_bridge_node')
+
+        self.declare_parameter('input_topic', '/vision_benchmark/pose_xyz_quat')
+        self.declare_parameter('output_topic', '/pose_estimation/object_pose')
+        self.declare_parameter('frame_id', 'camera_optical_frame')
+        self.declare_parameter('scale_xyz', [1.0, 1.0, 1.0])
+        self.declare_parameter('invert_xyz', [1.0, 1.0, 1.0])
+        self.declare_parameter('quat_scalar_first', False)
+
+        self._input_topic = self.get_parameter('input_topic').value
+        self._output_topic = self.get_parameter('output_topic').value
+        self._frame_id = self.get_parameter('frame_id').value
+        self._scale = list(self.get_parameter('scale_xyz').value)
+        self._invert = list(self.get_parameter('invert_xyz').value)
+        self._quat_scalar_first = self.get_parameter('quat_scalar_first').value
+
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+
+        self._pub = self.create_publisher(PoseStamped, self._output_topic, 10)
+        self._sub = self.create_subscription(
+            Float64MultiArray,
+            self._input_topic,
+            self._callback,
+            qos,
+        )
+
+        self.get_logger().info(
+            f'Bridging {self._input_topic} -> {self._output_topic} '
+            f'(frame_id={self._frame_id})'
+        )
+
+    def _callback(self, msg: Float64MultiArray):
+        if len(msg.data) < 7:
+            self.get_logger().warn(
+                f'Expected 7 pose values, got {len(msg.data)}',
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        x = float(msg.data[0]) * self._scale[0] * self._invert[0]
+        y = float(msg.data[1]) * self._scale[1] * self._invert[1]
+        z = float(msg.data[2]) * self._scale[2] * self._invert[2]
+        q1, q2, q3, q4 = (float(msg.data[3]), float(msg.data[4]),
+                          float(msg.data[5]), float(msg.data[6]))
+
+        out = PoseStamped()
+        out.header.stamp = self.get_clock().now().to_msg()
+        out.header.frame_id = self._frame_id
+        out.pose.position.x = x
+        out.pose.position.y = y
+        out.pose.position.z = z
+
+        if self._quat_scalar_first:
+            out.pose.orientation.w = q1
+            out.pose.orientation.x = q2
+            out.pose.orientation.y = q3
+            out.pose.orientation.z = q4
+        else:
+            # URSO JPL: q1,q2,q3 vector, q4 scalar
+            out.pose.orientation.x = q1
+            out.pose.orientation.y = q2
+            out.pose.orientation.z = q3
+            out.pose.orientation.w = q4
+
+        self._pub.publish(out)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PoseArrayBridgeNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

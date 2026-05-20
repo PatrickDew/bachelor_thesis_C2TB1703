@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""
+Standalone PID Controller Node
+
+Simple PID controller for basic docking control.
+"""
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float64MultiArray
+from geometry_msgs.msg import WrenchStamped
+import numpy as np
+
+from sdc_core.dynamics import ClohessyWiltshireDynamics
+from sdc_core.controllers import PIDController, ControlLimits
+
+
+class PIDControllerNode(Node):
+    """ROS2 node for PID control."""
+    
+    def __init__(self):
+        super().__init__('pid_controller_node')
+        
+        # Parameters
+        self.declare_parameter('kp', [0.01, 0.01, 0.01])
+        self.declare_parameter('ki', [0.001, 0.001, 0.001])
+        self.declare_parameter('kd', [0.1, 0.1, 0.1])
+        self.declare_parameter('mass', 500.0)
+        self.declare_parameter('rate', 10.0)
+        
+        kp = self.get_parameter('kp').value
+        ki = self.get_parameter('ki').value
+        kd = self.get_parameter('kd').value
+        mass = self.get_parameter('mass').value
+        rate = self.get_parameter('rate').value
+        
+        # Initialize controller
+        dynamics = ClohessyWiltshireDynamics(spacecraft_mass=mass)
+        limits = ControlLimits(max_acceleration=0.1)
+        self.controller = PIDController(dynamics, limits)
+        self.controller.set_gains(np.array(kp), np.array(ki), np.array(kd))
+        self.controller.dt = 1.0 / rate
+        
+        self.mass = mass
+        self.current_state = np.zeros(6)
+        self.target_state = np.zeros(6)
+        
+        # Subscribers
+        self.state_sub = self.create_subscription(
+            Float64MultiArray,
+            '/docking/state',
+            self.state_callback,
+            10
+        )
+        self.target_sub = self.create_subscription(
+            Float64MultiArray,
+            '/docking/target',
+            self.target_callback,
+            10
+        )
+        
+        # Publisher
+        self.wrench_pub = self.create_publisher(
+            WrenchStamped,
+            '/docking/control_wrench',
+            10
+        )
+        
+        # Timer
+        self.timer = self.create_timer(1.0/rate, self.control_callback)
+        
+        self.get_logger().info('PID Controller Node started')
+    
+    def state_callback(self, msg: Float64MultiArray):
+        self.current_state = np.array(msg.data[:6])
+    
+    def target_callback(self, msg: Float64MultiArray):
+        self.target_state = np.array(msg.data[:6])
+    
+    def control_callback(self):
+        accel = self.controller.compute_control(self.current_state, self.target_state)
+        force = accel * self.mass
+        
+        msg = WrenchStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'lvlh_frame'
+        msg.wrench.force.x = float(force[0])
+        msg.wrench.force.y = float(force[1])
+        msg.wrench.force.z = float(force[2])
+        
+        self.wrench_pub.publish(msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PIDControllerNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+

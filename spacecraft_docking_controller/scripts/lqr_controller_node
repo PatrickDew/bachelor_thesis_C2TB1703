@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""
+Standalone LQR Controller Node
+
+Optimal LQR controller for spacecraft docking.
+"""
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float64MultiArray
+from geometry_msgs.msg import WrenchStamped
+import numpy as np
+
+from sdc_core.dynamics import ClohessyWiltshireDynamics
+from sdc_core.controllers import LQRController, ControlLimits
+
+
+class LQRControllerNode(Node):
+    """ROS2 node for LQR control."""
+    
+    def __init__(self):
+        super().__init__('lqr_controller_node')
+        
+        # Parameters
+        self.declare_parameter('q_pos', 100.0)
+        self.declare_parameter('q_vel', 10.0)
+        self.declare_parameter('r', 1.0)
+        self.declare_parameter('mass', 500.0)
+        self.declare_parameter('rate', 10.0)
+        
+        q_pos = self.get_parameter('q_pos').value
+        q_vel = self.get_parameter('q_vel').value
+        r = self.get_parameter('r').value
+        mass = self.get_parameter('mass').value
+        rate = self.get_parameter('rate').value
+        
+        # Initialize controller
+        dynamics = ClohessyWiltshireDynamics(spacecraft_mass=mass)
+        limits = ControlLimits(max_acceleration=0.1)
+        self.controller = LQRController(dynamics, limits)
+        
+        Q = np.diag([q_pos, q_pos, q_pos, q_vel, q_vel, q_vel])
+        R = np.diag([r, r, r])
+        self.controller.set_weights(Q, R)
+        self.controller.dt = 1.0 / rate
+        
+        self.mass = mass
+        self.current_state = np.zeros(6)
+        self.target_state = np.zeros(6)
+        
+        # Subscribers
+        self.state_sub = self.create_subscription(
+            Float64MultiArray, '/docking/state', self.state_callback, 10)
+        self.target_sub = self.create_subscription(
+            Float64MultiArray, '/docking/target', self.target_callback, 10)
+        
+        # Publisher
+        self.wrench_pub = self.create_publisher(WrenchStamped, '/docking/control_wrench', 10)
+        
+        # Timer
+        self.timer = self.create_timer(1.0/rate, self.control_callback)
+        
+        self.get_logger().info(f'LQR Controller started with gain:\n{self.controller.get_gain()}')
+    
+    def state_callback(self, msg: Float64MultiArray):
+        self.current_state = np.array(msg.data[:6])
+    
+    def target_callback(self, msg: Float64MultiArray):
+        self.target_state = np.array(msg.data[:6])
+    
+    def control_callback(self):
+        accel = self.controller.compute_control(self.current_state, self.target_state)
+        force = accel * self.mass
+        
+        msg = WrenchStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'lvlh_frame'
+        msg.wrench.force.x = float(force[0])
+        msg.wrench.force.y = float(force[1])
+        msg.wrench.force.z = float(force[2])
+        
+        self.wrench_pub.publish(msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = LQRControllerNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+

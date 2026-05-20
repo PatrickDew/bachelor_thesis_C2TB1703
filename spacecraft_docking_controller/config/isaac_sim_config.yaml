@@ -1,0 +1,76 @@
+# Isaac Sim Integration Configuration
+# ====================================
+# 
+# This file contains configuration for integrating the docking controller
+# with NVIDIA Isaac Sim via ROS2.
+
+isaac_sim_bridge:
+  ros__parameters:
+    # ROS2 Domain ID (should match Isaac Sim settings)
+    domain_id: 0
+    
+    # Topic Remapping for Isaac Sim
+    # Isaac Sim typically expects these topic names:
+    isaac_topics:
+      # Force command input (controller output -> Isaac Sim)
+      force_command: "/spacecraft/force_command"
+      
+      # Velocity command (alternative control mode)
+      velocity_command: "/spacecraft/velocity_command"
+      
+      # Joint states from Isaac Sim (if using articulation)
+      joint_states: "/spacecraft/joint_states"
+      
+      # Ground truth pose from Isaac Sim (for testing)
+      ground_truth_pose: "/spacecraft/ground_truth_pose"
+    
+    # Coordinate Frame Configuration
+    frames:
+      # Isaac Sim world frame
+      world_frame: "world"
+      
+      # Target spacecraft frame (docking port)
+      target_frame: "target_docking_port"
+      
+      # Chaser spacecraft frame
+      chaser_frame: "chaser_body"
+      
+      # Camera frame (FoundationPose output)
+      camera_frame: "camera_link"
+    
+    # Physics Settings
+    physics:
+      # Simulation timestep (should match Isaac Sim)
+      timestep: 0.01  # seconds (100 Hz physics)
+      
+      # Enable contact detection
+      enable_contact: true
+      
+      # Docking contact threshold
+      contact_threshold: 0.1  # meters
+
+
+# Action Graph Configuration for Isaac Sim
+# ----------------------------------------
+# To receive ROS2 commands in Isaac Sim, you need to create an Action Graph
+# with the following nodes:
+#
+# 1. ROS2 Context Node
+#    - Creates ROS2 context for communication
+#
+# 2. ROS2 Subscribe Float64MultiArray Node
+#    - Topic: /spacecraft/force_command
+#    - Receives [Fx, Fy, Fz] force commands
+#
+# 3. Articulation Controller Node
+#    - Connects to spacecraft rigid body
+#    - Applies received forces
+#
+# 4. ROS2 Publish Pose Node (optional)
+#    - Publishes ground truth pose for testing
+#
+# See ISAAC_SIM_SETUP.md for detailed setup instructions.
+
+
+
+

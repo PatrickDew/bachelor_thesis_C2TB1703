@@ -1,0 +1,97 @@
+# Spacecraft Docking Controller Configuration
+# ===========================================
+
+docking_controller_node:
+  ros__parameters:
+    # Topic Configuration
+    pose_topic: "/pose_estimation/object_pose"
+    output_frame: "lvlh_frame"
+    
+    # Spacecraft Parameters
+    spacecraft_mass: 500.0        # kg
+    orbital_altitude: 400000.0    # meters (ISS orbit ~400km)
+    
+    # Controller Selection: "PID", "LQR", or "MPC"
+    # Use PID first when integrating vision_benchmark pose (frame tuning)
+    controller_type: "PID"
+    
+    # Control Loop Parameters
+    control_rate: 10.0            # Hz
+    max_force: 50.0               # N (per axis)
+    max_torque: 5.0               # N*m (per axis)
+    
+    # PID Controller Gains (SLOW, SMOOTH approach for docking)
+    pid_kp: [0.003, 0.003, 0.003]   # Very low proportional for slow approach
+    pid_ki: [0.0001, 0.0001, 0.0001] # Small integral for steady-state
+    pid_kd: [0.03, 0.03, 0.03]      # Higher derivative for damping oscillations
+    pid_kv: [0.0, 0.0, 0.0]         # Range-rate control disabled
+    
+    # Orbital Dynamics Mode
+    # Set to false for STATIONARY scenarios (no orbital gravity, ground test, simple 3D)
+    # Set to true only if Isaac Sim models actual orbital environment with gravity gradient
+    use_cw_feedforward: false
+    
+    # LQR Controller Weights
+    # (Used when controller_type = "LQR")
+    # Q matrix diagonal: [position_x, position_y, position_z, vel_x, vel_y, vel_z]
+    lqr_q_pos: 100.0              # Position state weight
+    lqr_q_vel: 10.0               # Velocity state weight
+    lqr_r: 1.0                    # Control effort weight
+    
+    # MPC Controller Parameters
+    # (Used when controller_type = "MPC")
+    mpc_horizon: 20               # Prediction horizon (timesteps)
+    
+    # State Estimator Parameters
+    pose_noise: 0.01              # Position measurement noise (m²) - LOW for tight tracking
+    attitude_noise: 0.01          # Attitude measurement noise (rad²)
+    outlier_threshold: 1000.0     # Mahalanobis distance threshold (high for space)
+    disable_outlier_rejection: true  # Set to true to accept ALL measurements
+    use_direct_measurement: true  # Bypass EKF, use raw pose directly (prevents drift)
+    
+    # Velocity Limiting (for smooth approach)
+    max_velocity_cmd: 0.005       # Maximum 0.5 cm/s (VERY SLOW for docking)
+    velocity_smoothing: 0.7       # Higher smoothing for smoother motion
+    
+    # Data Logging (for plotting/analysis)
+    enable_data_logging: true     # Log data to CSV file
+    # Logs are saved to ~/Documents/spacecraft_docking_controller/logs/ with timestamp
+    log_directory: "/home/sichentao/Documents/spacecraft_docking_controller/logs"
+    
+    # Docking Approach Parameters
+    approach_type: "v_bar"        # "v_bar" or "r_bar"
+    initial_standoff: 50.0        # Starting distance (m)
+    final_standoff: 0.5           # Final distance before contact (m)
+    approach_velocity: -0.1       # Nominal closing velocity (m/s)
+    
+    # Coordinate Frame Fine-tuning
+    # The main axis remapping is now hardcoded in the controller:
+    #   Twist X = Camera Z (forward)
+    #   Twist Y = -Camera X (left)
+    #   Twist Z = -Camera Y (up)
+    #
+    # These scale factors allow fine-tuning if needed (use -1.0 to invert)
+    axis_invert_x: 1.0     # Twist X (forward direction)
+    axis_invert_y: 1.0     # Twist Y (left/right direction)
+    axis_invert_z: 1.0     # Twist Z (up/down direction)
+
+
+# Aggressive Controller Settings (for testing)
+aggressive_controller:
+  ros__parameters:
+    controller_type: "LQR"
+    lqr_q_pos: 500.0
+    lqr_q_vel: 50.0
+    lqr_r: 0.5
+
+
+# Conservative Controller Settings (for safety)
+conservative_controller:
+  ros__parameters:
+    controller_type: "PID"
+    pid_kp: [0.0005, 0.0005, 0.0005]  # Very slow approach
+    pid_ki: [0.00005, 0.00005, 0.00005]
+    pid_kd: [0.005, 0.005, 0.005]
+    max_force: 10.0
+    max_velocity_cmd: 0.002           # Very slow max velocity
+

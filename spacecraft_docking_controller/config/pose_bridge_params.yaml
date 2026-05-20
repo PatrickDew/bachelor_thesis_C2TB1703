@@ -1,0 +1,11 @@
+# Pose bridge: vision_benchmark Float64MultiArray -> PoseStamped for docking controller
+
+pose_array_bridge_node:
+  ros__parameters:
+    input_topic: "/vision_benchmark/pose_xyz_quat"
+    output_topic: "/pose_estimation/object_pose"
+    frame_id: "camera_optical_frame"
+    # URSO / thesis default: q4 scalar. Set true only if model outputs q1 as scalar.
+    quat_scalar_first: false
+    scale_xyz: [1.0, 1.0, 1.0]
+    invert_xyz: [1.0, 1.0, 1.0]

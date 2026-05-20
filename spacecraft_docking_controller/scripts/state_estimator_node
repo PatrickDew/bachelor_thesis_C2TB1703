@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""
+Standalone State Estimator Node
+
+Runs state estimation independently for debugging or
+when using with external controllers.
+"""
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import Float64MultiArray
+from nav_msgs.msg import Odometry
+import numpy as np
+
+from sdc_core.dynamics import ClohessyWiltshireDynamics, OrbitalParameters
+from sdc_core.state_estimator import StateEstimator, EstimatorConfig
+
+
+class StateEstimatorNode(Node):
+    """ROS2 node for spacecraft state estimation."""
+    
+    def __init__(self):
+        super().__init__('state_estimator_node')
+        
+        # Parameters
+        self.declare_parameter('pose_topic', '/pose_estimation/object_pose')
+        self.declare_parameter('output_topic', '/docking/state')
+        self.declare_parameter('rate', 50.0)
+        
+        pose_topic = self.get_parameter('pose_topic').value
+        output_topic = self.get_parameter('output_topic').value
+        rate = self.get_parameter('rate').value
+        
+        # Initialize dynamics and estimator
+        self.dynamics = ClohessyWiltshireDynamics()
+        self.estimator = StateEstimator(dynamics=self.dynamics)
+        
+        # Subscriber
+        self.pose_sub = self.create_subscription(
+            PoseStamped,
+            pose_topic,
+            self.pose_callback,
+            10
+        )
+        
+        # Publishers
+        self.state_pub = self.create_publisher(Float64MultiArray, output_topic, 10)
+        self.odom_pub = self.create_publisher(Odometry, '/docking/odometry', 10)
+        
+        # Timer for state prediction
+        self.timer = self.create_timer(1.0/rate, self.timer_callback)
+        
+        self.get_logger().info('State Estimator Node started')
+    
+    def pose_callback(self, msg: PoseStamped):
+        """Handle incoming pose."""
+        position = np.array([
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z
+        ])
+        quaternion = np.array([
+            msg.pose.orientation.w,
+            msg.pose.orientation.x,
+            msg.pose.orientation.y,
+            msg.pose.orientation.z
+        ])
+        timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        
+        self.estimator.update(position, quaternion, timestamp)
+    
+    def timer_callback(self):
+        """Periodic state prediction and publishing."""
+        dt = 1.0 / self.get_parameter('rate').value
+        self.estimator.predict(dt)
+        
+        # Publish state array
+        state = self.estimator.get_translational_state()
+        msg = Float64MultiArray()
+        msg.data = state.tolist()
+        self.state_pub.publish(msg)
+        
+        # Publish odometry
+        odom = Odometry()
+        odom.header.stamp = self.get_clock().now().to_msg()
+        odom.header.frame_id = 'lvlh_frame'
+        odom.child_frame_id = 'spacecraft'
+        
+        odom.pose.pose.position.x = state[0]
+        odom.pose.pose.position.y = state[1]
+        odom.pose.pose.position.z = state[2]
+        
+        attitude = self.estimator.get_attitude()
+        odom.pose.pose.orientation.w = attitude[0]
+        odom.pose.pose.orientation.x = attitude[1]
+        odom.pose.pose.orientation.y = attitude[2]
+        odom.pose.pose.orientation.z = attitude[3]
+        
+        odom.twist.twist.linear.x = state[3]
+        odom.twist.twist.linear.y = state[4]
+        odom.twist.twist.linear.z = state[5]
+        
+        self.odom_pub.publish(odom)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = StateEstimatorNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+
