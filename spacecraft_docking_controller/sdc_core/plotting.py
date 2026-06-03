@@ -340,6 +340,100 @@ def plot_paper_dashboard(df: pd.DataFrame, output_dir: str, show: bool = False) 
     return out_png
 
 
+def run_technical_analysis(
+    df: pd.DataFrame,
+    output_dir: str,
+    show: bool = True,
+) -> str:
+    """
+    Single technical figure + summary (one notebook cell).
+
+    Works with old CSV (pos_x only) and new CSV (err_x, force_isaac_*).
+    """
+    apply_paper_style()
+    os.makedirs(output_dir, exist_ok=True)
+
+    if not _has_cols(df, 'err_x'):
+        df = df.copy()
+        df['err_x'] = df['pos_x']
+        df['err_y'] = df['pos_y']
+        df['err_z'] = df['pos_z']
+
+    initial = float(df['range'].iloc[0])
+    final = float(df['range'].iloc[-1])
+    diverged = final > initial + 0.05
+    mean_rate = float(df['range_rate'].mean()) * 100
+
+    fig = plt.figure(figsize=(11, 8.5))
+    gs = GridSpec(3, 2, figure=fig, hspace=0.35, wspace=0.28)
+
+    ax1 = fig.add_subplot(gs[0, :])
+    ax1.plot(df['time'], df['range'], 'k-', lw=1.5)
+    ax1.axhline(initial, color='gray', ls=':', lw=1)
+    ax1.set_ylabel('Range (m)')
+    ax1.set_title('(a) Range to target')
+    ax1.grid(True, alpha=0.3)
+
+    ax2 = fig.add_subplot(gs[1, 0])
+    ax2.plot(df['time'], df['err_x'], label='x', lw=1.2)
+    ax2.plot(df['time'], df['err_y'], label='y', lw=1.2)
+    ax2.plot(df['time'], df['err_z'], label='z', lw=1.2)
+    ax2.axhline(0, color='gray', ls='--', lw=0.8)
+    ax2.set_ylabel('Error (m)')
+    ax2.set_title('(b) Position error (camera frame)')
+    ax2.legend(fontsize=9)
+    ax2.grid(True, alpha=0.3)
+
+    ax3 = fig.add_subplot(gs[1, 1])
+    ax3.plot(df['time'], df['range_rate'] * 100, 'k-', lw=1.2)
+    ax3.axhline(0, color='gray', lw=0.8)
+    ax3.fill_between(df['time'], df['range_rate'] * 100, 0,
+                     where=(df['range_rate'] > 0), alpha=0.15, color='red',
+                     label='Moving away')
+    ax3.fill_between(df['time'], df['range_rate'] * 100, 0,
+                     where=(df['range_rate'] < 0), alpha=0.15, color='green',
+                     label='Closing')
+    ax3.set_ylabel('Rate (cm/s)')
+    ax3.set_title('(c) Closing rate (<0 = approach)')
+    ax3.legend(fontsize=8)
+    ax3.grid(True, alpha=0.3)
+
+    ax4 = fig.add_subplot(gs[2, 0])
+    ax4.plot(df['time'], df['ctrl_x'] * 1000, label='ax', lw=1)
+    ax4.plot(df['time'], df['ctrl_y'] * 1000, label='ay', lw=1)
+    ax4.plot(df['time'], df['ctrl_z'] * 1000, label='az', lw=1)
+    ax4.set_xlabel('Time (s)')
+    ax4.set_ylabel('mm/s²')
+    ax4.set_title('(d) PID command (camera frame)')
+    ax4.legend(fontsize=8)
+    ax4.grid(True, alpha=0.3)
+
+    ax5 = fig.add_subplot(gs[2, 1])
+    ax5.scatter(df['range'], df['range_rate'] * 100, c=df['time'],
+                cmap='viridis', s=8, alpha=0.8)
+    ax5.axhline(0, color='gray', lw=0.8)
+    ax5.set_xlabel('Range (m)')
+    ax5.set_ylabel('Closing rate (cm/s)')
+    ax5.set_title('(e) Phase plane')
+    ax5.grid(True, alpha=0.3)
+
+    status = 'DIVERGED' if diverged else 'APPROACHING'
+    fig.suptitle(
+        f'Closed-loop PID docking analysis — {status}',
+        fontsize=13, fontweight='bold',
+    )
+    fig.text(
+        0.99, 0.01,
+        f't={df["time"].max():.1f}s | r: {initial:.2f}→{final:.2f} m | mean rate {mean_rate:.2f} cm/s',
+        ha='right', va='bottom', fontsize=9, family='monospace',
+    )
+
+    out = os.path.join(output_dir, 'docking_technical_analysis.png')
+    _save(fig, out, show=show)
+    write_summary(df, output_dir)
+    return out
+
+
 def generate_all_figures(
     df: pd.DataFrame,
     output_dir: str,

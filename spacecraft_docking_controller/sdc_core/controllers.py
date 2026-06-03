@@ -377,26 +377,16 @@ class PIDController(BaseController):
         return np.array([ax_ff, ay_ff, az_ff])
     
     def _compute_gain_scale(self, range_m: float) -> float:
-        """
-        Compute smooth gain scaling factor based on range.
-        
-        Uses exponential scheduling for smooth transition:
-        - Far range (>50m): Low gain for stability
-        - Mid range (10-50m): Moderate gain
-        - Close range (<10m): Higher gain for precision
-        - Terminal (<1m): Maximum gain for final approach
-        """
-        # Smooth exponential gain scheduling
-        if range_m > 50.0:
-            return 0.3  # Far range - very conservative
-        elif range_m > 10.0:
-            # Smooth transition from 0.3 to 1.0
-            return 0.3 + 0.7 * (50.0 - range_m) / 40.0
-        elif range_m > 1.0:
-            # Smooth transition from 1.0 to 2.0
-            return 1.0 + 1.0 * (10.0 - range_m) / 9.0
-        else:
-            return 2.0  # Terminal - highest gains
+        """Smooth gain scheduling — very low gain when far (noisy vision)."""
+        if range_m > 20.0:
+            return 0.08
+        if range_m > 5.0:
+            return 0.08 + 0.42 * (20.0 - range_m) / 15.0
+        if range_m > 1.0:
+            return 0.5 + 0.5 * (5.0 - range_m) / 4.0
+        if range_m > 0.2:
+            return 1.0
+        return 1.5
     
     def reset(self):
         """Reset integral and derivative states."""

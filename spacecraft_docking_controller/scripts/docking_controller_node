@@ -54,6 +54,12 @@ from sdc_core.coordinate_frames import (
     camera_to_isaac_vector,
     closing_velocity,
 )
+from sdc_core.pose_filter import VisionPoseFilter
+from sdc_core.control_guards import (
+    RangeMonotonicGuard,
+    ensure_closing_direction,
+    ensure_control_toward_target,
+)
 try:
     from sdc_core.log_paths import resolve_log_directory
 except ImportError:
@@ -165,6 +171,9 @@ class DockingControllerNode(Node):
         # Smoothed velocity estimate (low-pass on finite differences)
         self.filtered_velocity = np.zeros(3)
         self.velocity_filter_alpha = 0.4
+        self.pose_filter = VisionPoseFilter()
+        self.range_guard = RangeMonotonicGuard()
+        self.prev_force_applied = np.zeros(3)
         
         # Frame remap config
         self.frame_remap = FrameRemapConfig()
@@ -328,6 +337,12 @@ class DockingControllerNode(Node):
         self.declare_parameter('velocity_filter_alpha', 0.4)
         self.declare_parameter('use_trajectory_tracking', False)
         self.declare_parameter('pose_jump_threshold', 0.15)
+        self.declare_parameter('pose_filter_alpha', 0.08)
+        self.declare_parameter('pose_max_step_m', 0.08)
+        self.declare_parameter('pose_max_rate_m_s', 0.05)
+        self.declare_parameter('max_force_slew_n_per_s', 4.0)
+        self.declare_parameter('use_control_guards', True)
+        self.declare_parameter('fix_frame_sign', True)
         self.declare_parameter('range_rate_mode', 'brake_only')
         self.declare_parameter('max_closing_rate', 0.003)
         
@@ -407,6 +422,17 @@ class DockingControllerNode(Node):
         self.ground_truth_topic = self.get_parameter('ground_truth_topic').value
         self.use_trajectory_tracking = self.get_parameter('use_trajectory_tracking').value
         self.pose_jump_threshold = self.get_parameter('pose_jump_threshold').value
+        self.pose_filter_alpha = self.get_parameter('pose_filter_alpha').value
+        self.pose_max_step_m = self.get_parameter('pose_max_step_m').value
+        self.pose_max_rate_m_s = self.get_parameter('pose_max_rate_m_s').value
+        self.max_force_slew_n_per_s = self.get_parameter('max_force_slew_n_per_s').value
+        self.use_control_guards = self.get_parameter('use_control_guards').value
+        self.fix_frame_sign = self.get_parameter('fix_frame_sign').value
+        self.pose_filter = VisionPoseFilter(
+            ema_alpha=self.pose_filter_alpha,
+            max_step_m=self.pose_max_step_m,
+            max_rate_m_s=self.pose_max_rate_m_s,
+        )
         self.range_rate_mode = self.get_parameter('range_rate_mode').value
         self.max_closing_rate = self.get_parameter('max_closing_rate').value
         self.use_cw_feedforward = self.get_parameter('use_cw_feedforward').value
@@ -515,45 +541,31 @@ class DockingControllerNode(Node):
         current_time = self.get_clock().now().nanoseconds / 1e9
         
         if self.use_direct_measurement:
-            # Reject vision outliers (single-frame jumps)
-            if self.prev_raw_pose is not None:
-                jump = float(np.linalg.norm(position - self.prev_raw_pose))
-                if jump > self.pose_jump_threshold:
-                    self.get_logger().warn(
-                        f'Pose jump {jump:.3f}m rejected — using previous state',
-                        throttle_duration_sec=1.0,
-                    )
-                    if hasattr(self.controller, 'reset'):
-                        self.controller.reset()
-                    return
+            position = self.pose_filter.update(position, current_time)
 
             self.raw_pose = position.copy()
             
-            # Estimate velocity from finite differences with low-pass filter
             velocity = np.zeros(3)
             if self.prev_raw_pose is not None and self.prev_raw_time is not None:
                 dt = current_time - self.prev_raw_time
                 if dt > 0.001:
                     raw_vel = (position - self.prev_raw_pose) / dt
-                    alpha = self.velocity_filter_alpha
+                    alpha = min(self.velocity_filter_alpha, 0.15)
                     self.filtered_velocity = (
                         alpha * raw_vel
                         + (1.0 - alpha) * self.filtered_velocity
                     )
                     velocity = self.filtered_velocity.copy()
             
-            # Update state directly from raw measurements
             self.current_state[0:3] = position
             self.current_state[3:6] = velocity
             
-            # Store for next iteration
             self.prev_raw_pose = position.copy()
             self.prev_raw_time = current_time
             self.last_pose_time = current_time
             
-            # Log received pose
             self.get_logger().info(
-                f'DIRECT: Pose: [{position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}]',
+                f'FILTERED: [{position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}]',
                 throttle_duration_sec=1.0
             )
         else:
@@ -623,6 +635,9 @@ class DockingControllerNode(Node):
         self.control_enabled = True
         self.current_phase = DockingPhase.FAR_RANGE
         self.controller.reset()
+        self.pose_filter.reset()
+        self.range_guard.reset()
+        self.prev_force_applied = np.zeros(3)
         self.smoothed_force_cmd = np.zeros(3)
         self.smoothed_velocity_cmd = np.zeros(3)
         self.filtered_velocity = np.zeros(3)
@@ -659,6 +674,9 @@ class DockingControllerNode(Node):
         self.control_enabled = False
         self.current_phase = DockingPhase.HOLD
         self.controller.reset()
+        self.pose_filter.reset()
+        self.range_guard.reset()
+        self.prev_force_applied = np.zeros(3)
         
         # Publish zero commands
         self._publish_zero_control()
@@ -709,6 +727,22 @@ class DockingControllerNode(Node):
             self.target_state
         )
 
+        pos_error = self.target_state[0:3] - self.current_state[0:3]
+        vel = self.current_state[3:6]
+        distance = float(np.linalg.norm(pos_error))
+        range_rate = closing_velocity(pos_error, vel)
+
+        if self.use_control_guards:
+            guard_scale = self.range_guard.update(distance)
+            control_accel = control_accel * guard_scale
+            if self.fix_frame_sign:
+                control_accel = ensure_control_toward_target(
+                    control_accel, pos_error,
+                )
+            control_accel = ensure_closing_direction(
+                control_accel, pos_error, vel,
+            )
+
         # Auto-hold when PID reports terminal convergence
         if (self.auto_hold_on_complete and
                 getattr(self.controller, 'docking_complete', False)):
@@ -732,19 +766,12 @@ class DockingControllerNode(Node):
             self._update_phase()
             return
         
-        # Consistent error convention: target - current (negative range_rate = closing)
-        pos_error = self.target_state[0:3] - self.current_state[0:3]
-        vel = self.current_state[3:6]
-        distance = float(np.linalg.norm(pos_error))
-        range_rate = closing_velocity(pos_error, vel)
-        
         self.get_logger().info(
             f'Range: {distance:.3f}m | Rate: {range_rate*100:.2f}cm/s | '
             f'Pos: [{self.current_state[0]:.2f}, {self.current_state[1]:.2f}, {self.current_state[2]:.2f}]',
             throttle_duration_sec=1.0
         )
         
-        # Camera-frame PID output -> Isaac world frame
         control_isaac = camera_to_isaac_vector(control_accel, self.frame_remap)
         control_force = control_isaac * self.spacecraft_mass
 
@@ -762,6 +789,17 @@ class DockingControllerNode(Node):
             force_out = self.smoothed_force_cmd
         else:
             force_out = control_force
+
+        dt_ctrl = 1.0 / max(self.control_rate, 1.0)
+        max_force_step = self.max_force_slew_n_per_s * dt_ctrl
+        delta_f = force_out - self.prev_force_applied
+        df_norm = float(np.linalg.norm(delta_f))
+        if df_norm > max_force_step:
+            force_out = (
+                self.prev_force_applied
+                + delta_f * (max_force_step / df_norm)
+            )
+        self.prev_force_applied = force_out.copy()
 
         # Publish control commands (Isaac frame)
         self._publish_wrench(force_out)

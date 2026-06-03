@@ -1,42 +1,50 @@
-# PID overlay for isaac_multitask vision (isaac_vision_docking.launch.py)
-# Tuned for ~1m standoff, noisy pose, Isaac Sim force control
+# Vision PID overlay — conservative + heavy filtering (isaac_vision_docking.launch.py)
 
 docking_controller_node:
   ros__parameters:
     controller_type: "PID"
     control_rate: 20.0
-    velocity_smoothing: 0.82
-    force_smoothing: 0.78
+    velocity_smoothing: 0.90
+    force_smoothing: 0.92
 
     use_trajectory_tracking: false
     range_rate_mode: "brake_only"
-    max_closing_rate: 0.002
+    max_closing_rate: 0.001
 
-    pid_kp: [0.004, 0.004, 0.006]
-    pid_ki: [0.0002, 0.0002, 0.0004]
-    pid_kd: [0.25, 0.25, 0.30]
-    pid_kv: [0.05, 0.05, 0.06]
+    pid_kp: [0.0015, 0.0015, 0.0025]
+    pid_ki: [0.00005, 0.00005, 0.0001]
+    pid_kd: [0.35, 0.35, 0.40]
+    pid_kv: [0.02, 0.02, 0.03]
 
     use_los_guidance: true
-    pid_kp_lateral: 0.008
-    pid_ki_lateral: 0.0004
-    pid_kd_lateral: 0.20
+    pid_kp_lateral: 0.003
+    pid_ki_lateral: 0.0001
+    pid_kd_lateral: 0.25
 
-    docking_complete_range: 0.08
-    docking_complete_velocity: 0.003
+    docking_complete_range: 0.10
+    docking_complete_velocity: 0.004
     auto_hold_on_complete: true
-    velocity_filter_alpha: 0.25
-    pose_jump_threshold: 0.12
+    velocity_filter_alpha: 0.12
 
-    max_velocity_cmd: 0.003
-    max_force: 15.0
+    pose_filter_alpha: 0.08
+    pose_max_step_m: 0.06
+    pose_max_rate_m_s: 0.04
+    max_force_slew_n_per_s: 3.0
+    use_control_guards: true
+    fix_frame_sign: true
 
-    # SIGN TUNING: drift RIGHT -> try axis_invert_y: -1.0
-    # moves AWAY from target -> flip axis_invert_x
+    max_velocity_cmd: 0.002
+    max_force: 8.0
+
     axis_invert_x: -1.0
     axis_invert_y: 1.0
     axis_invert_z: 1.0
 
-    ground_truth_topic: "/spacecraft/ground_truth_pose"
     log_vision_raw_pose: true
     vision_raw_pose_topic: "/vision_benchmark/pose_xyz_quat"
+
+pose_array_bridge_node:
+  ros__parameters:
+    enable_position_smoothing: true
+    position_smoothing_alpha: 0.06
+    scale_xyz: [1.0, 1.0, 1.0]

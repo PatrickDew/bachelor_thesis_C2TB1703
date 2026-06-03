@@ -18,6 +18,8 @@ from std_msgs.msg import Float64MultiArray
 from geometry_msgs.msg import PoseStamped
 import numpy as np
 
+from sdc_core.pose_filter import VisionPoseFilter
+
 
 class PoseArrayBridgeNode(Node):
     def __init__(self):
@@ -31,7 +33,9 @@ class PoseArrayBridgeNode(Node):
         self.declare_parameter('quat_scalar_first', False)
         # EMA: smoothed = alpha * raw + (1-alpha) * smoothed. Lower alpha = smoother.
         self.declare_parameter('enable_position_smoothing', True)
-        self.declare_parameter('position_smoothing_alpha', 0.35)
+        self.declare_parameter('position_smoothing_alpha', 0.06)
+        self.declare_parameter('pose_max_step_m', 0.10)
+        self.declare_parameter('pose_max_rate_m_s', 0.06)
 
         self._input_topic = self.get_parameter('input_topic').value
         self._output_topic = self.get_parameter('output_topic').value
@@ -43,7 +47,12 @@ class PoseArrayBridgeNode(Node):
         self._alpha = float(self.get_parameter('position_smoothing_alpha').value)
         self._alpha = float(np.clip(self._alpha, 0.01, 1.0))
 
-        self._filt_pos: Optional[np.ndarray] = None
+        self._filter = VisionPoseFilter(
+            ema_alpha=self._alpha,
+            max_step_m=float(self.get_parameter('pose_max_step_m').value),
+            max_rate_m_s=float(self.get_parameter('pose_max_rate_m_s').value),
+        )
+        self._last_time: Optional[float] = None
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -68,14 +77,10 @@ class PoseArrayBridgeNode(Node):
             f'Bridging {self._input_topic} -> {self._output_topic} ({smooth_msg})'
         )
 
-    def _smooth_position(self, raw: np.ndarray) -> np.ndarray:
+    def _smooth_position(self, raw: np.ndarray, stamp: float) -> np.ndarray:
         if not self._smooth_pos:
             return raw
-        if self._filt_pos is None:
-            self._filt_pos = raw.copy()
-            return raw
-        self._filt_pos = self._alpha * raw + (1.0 - self._alpha) * self._filt_pos
-        return self._filt_pos.copy()
+        return self._filter.update(raw, stamp)
 
     def _callback(self, msg: Float64MultiArray):
         if len(msg.data) < 7:
@@ -90,7 +95,7 @@ class PoseArrayBridgeNode(Node):
             float(msg.data[1]) * self._scale[1] * self._invert[1],
             float(msg.data[2]) * self._scale[2] * self._invert[2],
         ])
-        pos = self._smooth_position(raw)
+        pos = self._smooth_position(raw, self.get_clock().now().nanoseconds / 1e9)
         q1, q2, q3, q4 = (float(msg.data[3]), float(msg.data[4]),
                           float(msg.data[5]), float(msg.data[6]))
 
