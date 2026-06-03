@@ -39,7 +39,6 @@ if _PKG_ROOT not in sys.path:
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 try:
     from sdc_core.log_paths import find_latest_log, log_search_directories
@@ -266,8 +265,12 @@ def plot_twist_commands(df: pd.DataFrame, output_dir: str, show: bool) -> None:
 
 
 def plot_trajectory_3d(df: pd.DataFrame, output_dir: str, show: bool) -> None:
-    fig = plt.figure(figsize=(12, 10))
-    ax = fig.add_subplot(111, projection='3d')
+    try:
+        fig = plt.figure(figsize=(12, 10))
+        ax = fig.add_subplot(111, projection='3d')
+    except Exception:
+        print('Skipping 3D plot (matplotlib 3D projection unavailable)')
+        return
     scatter = ax.scatter(
         df['pos_x'], df['pos_y'], df['pos_z'],
         c=df['time'], cmap='plasma', s=20, alpha=0.7,
@@ -478,6 +481,10 @@ def main():
         help='Skip combined docking_performance.png/pdf',
     )
     parser.add_argument(
+        '--paper', action='store_true',
+        help='Generate publication-quality figures (fig01-07 + paper dashboard)',
+    )
+    parser.add_argument(
         '--compare', action='store_true',
         help='Also plot range comparison for all docking_*.csv in the log folder',
     )
@@ -508,7 +515,12 @@ def main():
 
     write_summary(df, output_dir)
 
-    if not args.combined_only:
+    if args.paper:
+        from sdc_core.plotting import generate_all_figures, write_summary as paper_summary
+        print('\n--- Publication-quality figures ---')
+        paper_summary(df, output_dir)
+        generate_all_figures(df, output_dir, show=show)
+    elif not args.combined_only:
         print('\n--- Individual analysis plots (notebook style) ---')
         plot_all_individual(df, output_dir, show=False)
 

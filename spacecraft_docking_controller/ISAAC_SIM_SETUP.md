@@ -226,8 +226,8 @@ cd /path/to/spacecraft_docking_controller
 colcon build --packages-select spacecraft_docking_controller
 source install/setup.bash
 
-# Bridge + controller (recommended with vision_benchmark)
-ros2 launch spacecraft_docking_controller isaac_vision_docking.launch.py controller:=PID
+# Bridge + PID controller (loads config/vision_pid_params.yaml for smooth vision pose)
+ros2 launch spacecraft_docking_controller isaac_vision_docking.launch.py
 
 # Or bridge only:
 # ros2 launch spacecraft_docking_controller pose_bridge.launch.py
@@ -242,6 +242,44 @@ ros2 topic pub /docking/enable std_msgs/Bool "data: true" -1
 # Start docking sequence
 ros2 topic pub /docking/command std_msgs/String "data: 'start'" -1
 ```
+
+## Coordinate Frames & Ground Truth
+
+The controller operates in the **vision/camera frame** and remaps forces to **Isaac Sim world frame**:
+
+| Frame | Axes | Used for |
+|-------|------|----------|
+| Camera (URSO) | X=right, Y=down, Z=depth | Vision pose, PID error |
+| Isaac command | X=fwd, Y=left, Z=up | `/spacecraft/force_command` |
+
+Remap: `Isaac_X ← cam_Z`, `Isaac_Y ← -cam_X`, `Isaac_Z ← -cam_Y` (with optional sign flips in `vision_pid_params.yaml`).
+
+**If the chaser moves away from the target:** flip `axis_invert_x: -1.0` ↔ `1.0` in `config/vision_pid_params.yaml`.
+
+### Isaac Sim ground truth (optional, for validation)
+
+Publish chaser position relative to docking port from Isaac Sim:
+
+```
+ROS2 Publish PoseStamped
+  Topic: /spacecraft/ground_truth_pose
+  frame_id: world
+```
+
+The controller logs `gt_pos_*` in CSV and publishes `/docking/isaac_state` with:
+`[isaac_x, isaac_y, isaac_z, cam_x, cam_y, cam_z, gt_x, gt_y, gt_z]`.
+
+Monitor:
+```bash
+ros2 topic echo /docking/isaac_state
+ros2 topic echo /docking/status   # includes "Complete: True" when docked
+```
+
+### Auto-stop (terminal hold)
+
+When range < **5 cm** and speed < **2 mm/s**, the PID sets `docking_complete=True` and auto-holds (zero force). Tune in `vision_pid_params.yaml`:
+- `docking_complete_range`
+- `docking_complete_velocity`
 
 ## Step 6: Monitor and Debug
 
@@ -266,6 +304,33 @@ Add these displays:
 - `/docking/visualization` (MarkerArray)
 - `/pose_estimation/object_pose` (PoseStamped)
 - TF tree
+
+### Plot CSV logs (after a run)
+
+Logs default: `/home/sichentao/Documents/spacecraft_docking_controller/logs/docking_*.csv`  
+(override `log_directory` in yaml, or `export DOCKING_LOG_DIRECTORY=...` on another machine.)  
+Plots are saved **in the same folder** as the CSV (`docking_performance.png` / `.pdf`).
+
+```bash
+cd spacecraft_docking_controller
+pip install numpy matplotlib pandas
+
+# Publication figures for thesis / presentation
+python scripts/plot_docking_data.py --latest --paper --no-show
+
+# Specific CSV
+python scripts/plot_docking_data.py logs/docking_20260520_143022.csv
+
+# Compare multiple runs in logs/
+python scripts/plot_docking_data.py --latest --compare
+```
+
+Outputs: `fig01_range_profile.png` … `fig05_phase_plane.png`, `docking_paper_figure.png/pdf`, `docking_summary.txt`
+
+On Windows: `start logs\plot_control_outputs.png` or open the `logs` folder in Explorer.
+
+If you used an older script that wrote to `/tmp`, open WSL’s `/tmp/docking_performance.png` or copy it out:
+`cp /tmp/docking_performance.png ./logs/`
 
 ## Alternative: Isaac Sim Python API
 

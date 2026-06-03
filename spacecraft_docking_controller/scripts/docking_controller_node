@@ -49,6 +49,11 @@ from sdc_core.trajectory_generator import (
     ApproachType,
     DockingPhase
 )
+from sdc_core.coordinate_frames import (
+    FrameRemapConfig,
+    camera_to_isaac_vector,
+    closing_velocity,
+)
 try:
     from sdc_core.log_paths import resolve_log_directory
 except ImportError:
@@ -152,8 +157,17 @@ class DockingControllerNode(Node):
         # Raw vision pose from isaac_multitask (logged alongside controller pose)
         self.vision_raw_pose = np.array([np.nan, np.nan, np.nan])
         self.has_vision_raw_pose = False
+
+        # Isaac Sim ground truth (optional, for validation / logging)
+        self.isaac_gt_pose = np.array([np.nan, np.nan, np.nan])
+        self.has_isaac_gt_pose = False
         
-        # Smoothed velocity / force output for gradual approach
+        # Smoothed velocity estimate (low-pass on finite differences)
+        self.filtered_velocity = np.zeros(3)
+        self.velocity_filter_alpha = 0.4
+        
+        # Frame remap config
+        self.frame_remap = FrameRemapConfig()
         self.smoothed_velocity_cmd = np.zeros(3)
         self.smoothed_force_cmd = np.zeros(3)
         
@@ -206,6 +220,17 @@ class DockingControllerNode(Node):
             self.get_logger().info(
                 f'Logging raw vision pose from: {self.vision_raw_pose_topic}'
             )
+
+        if self.ground_truth_topic:
+            self.gt_pose_sub = self.create_subscription(
+                PoseStamped,
+                self.ground_truth_topic,
+                self.ground_truth_callback,
+                qos_profile,
+            )
+            self.get_logger().info(
+                f'Subscribed to Isaac ground truth: {self.ground_truth_topic}'
+            )
         
         # Publishers
         self.wrench_pub = self.create_publisher(
@@ -242,6 +267,12 @@ class DockingControllerNode(Node):
         self.isaac_force_pub = self.create_publisher(
             Float64MultiArray,
             '/spacecraft/force_command',
+            10
+        )
+
+        self.isaac_state_pub = self.create_publisher(
+            Float64MultiArray,
+            '/docking/isaac_state',
             10
         )
         
@@ -286,7 +317,16 @@ class DockingControllerNode(Node):
         self.declare_parameter('pid_kp', [0.01, 0.01, 0.01])
         self.declare_parameter('pid_ki', [0.001, 0.001, 0.001])
         self.declare_parameter('pid_kd', [0.1, 0.1, 0.1])
-        self.declare_parameter('pid_kv', [0.1, 0.1, 0.1])  # Range rate control gains
+        self.declare_parameter('pid_kv', [0.08, 0.08, 0.12])
+        self.declare_parameter('pid_kp_lateral', 0.015)
+        self.declare_parameter('pid_ki_lateral', 0.001)
+        self.declare_parameter('pid_kd_lateral', 0.12)
+        self.declare_parameter('use_los_guidance', True)
+        self.declare_parameter('docking_complete_range', 0.05)
+        self.declare_parameter('docking_complete_velocity', 0.002)
+        self.declare_parameter('auto_hold_on_complete', True)
+        self.declare_parameter('velocity_filter_alpha', 0.4)
+        self.declare_parameter('ground_truth_topic', '/spacecraft/ground_truth_pose')
         
         # CW Feedforward (set false for stationary ISS, true for orbital environment)
         self.declare_parameter('use_cw_feedforward', False)
@@ -328,7 +368,7 @@ class DockingControllerNode(Node):
         self.declare_parameter('enable_data_logging', False)
         self.declare_parameter(
             'log_directory',
-            '/home/sichentao/Documents/spacecraft_docking_controller/logs',
+            '',
         )
         self.declare_parameter('log_vision_raw_pose', True)
         self.declare_parameter(
@@ -353,6 +393,15 @@ class DockingControllerNode(Node):
         self.pid_ki = self.get_parameter('pid_ki').value
         self.pid_kd = self.get_parameter('pid_kd').value
         self.pid_kv = self.get_parameter('pid_kv').value
+        self.pid_kp_lateral = self.get_parameter('pid_kp_lateral').value
+        self.pid_ki_lateral = self.get_parameter('pid_ki_lateral').value
+        self.pid_kd_lateral = self.get_parameter('pid_kd_lateral').value
+        self.use_los_guidance = self.get_parameter('use_los_guidance').value
+        self.docking_complete_range = self.get_parameter('docking_complete_range').value
+        self.docking_complete_velocity = self.get_parameter('docking_complete_velocity').value
+        self.auto_hold_on_complete = self.get_parameter('auto_hold_on_complete').value
+        self.velocity_filter_alpha = self.get_parameter('velocity_filter_alpha').value
+        self.ground_truth_topic = self.get_parameter('ground_truth_topic').value
         self.use_cw_feedforward = self.get_parameter('use_cw_feedforward').value
         
         self.lqr_q_pos = self.get_parameter('lqr_q_pos').value
@@ -371,10 +420,15 @@ class DockingControllerNode(Node):
         self.final_standoff = self.get_parameter('final_standoff').value
         self.approach_velocity = self.get_parameter('approach_velocity').value
         
-        # Axis inversion
+        # Axis inversion -> frame remap config
         self.axis_invert_x = self.get_parameter('axis_invert_x').value
         self.axis_invert_y = self.get_parameter('axis_invert_y').value
         self.axis_invert_z = self.get_parameter('axis_invert_z').value
+        self.frame_remap = FrameRemapConfig(
+            invert_x=self.axis_invert_x,
+            invert_y=self.axis_invert_y,
+            invert_z=self.axis_invert_z,
+        )
         
         # Direct measurement mode and velocity limits
         self.use_direct_measurement = self.get_parameter('use_direct_measurement').value
@@ -404,12 +458,23 @@ class DockingControllerNode(Node):
                 np.array(self.pid_ki),
                 np.array(self.pid_kd)
             )
-            # Set range rate control gain
             controller.kv = np.array(self.pid_kv)
-            # Set CW feedforward mode (false for stationary ISS)
             controller.use_cw_feedforward = self.use_cw_feedforward
-            mode = "ORBITAL (CW feedforward ON)" if self.use_cw_feedforward else "STATIONARY (simple PID)"
+            controller.use_los_guidance = self.use_los_guidance
+            controller.kp_lateral = self.pid_kp_lateral
+            controller.ki_lateral = self.pid_ki_lateral
+            controller.kd_lateral = self.pid_kd_lateral
+            controller.docking_complete_range = self.docking_complete_range
+            controller.docking_complete_velocity = self.docking_complete_velocity
+            mode = "ORBITAL (CW feedforward ON)" if self.use_cw_feedforward else "STATIONARY (vision PID + LOS)"
             self.get_logger().info(f'PID mode: {mode}')
+            self.get_logger().info(
+                f'PID: Kp={self.pid_kp}, Ki={self.pid_ki}, Kd={self.pid_kd}, Kv={self.pid_kv}'
+            )
+            self.get_logger().info(
+                f'Terminal hold: range<{self.docking_complete_range}m, '
+                f'|v|<{self.docking_complete_velocity}m/s'
+            )
         elif self.controller_type == 'LQR':
             Q = np.diag([self.lqr_q_pos] * 3 + [self.lqr_q_vel] * 3)
             R = np.diag([self.lqr_r] * 3)
@@ -444,12 +509,18 @@ class DockingControllerNode(Node):
             # DIRECT MEASUREMENT MODE: Use raw pose directly (no EKF drift)
             self.raw_pose = position.copy()
             
-            # Estimate velocity from finite differences
+            # Estimate velocity from finite differences with low-pass filter
             velocity = np.zeros(3)
             if self.prev_raw_pose is not None and self.prev_raw_time is not None:
                 dt = current_time - self.prev_raw_time
                 if dt > 0.001:
-                    velocity = (position - self.prev_raw_pose) / dt
+                    raw_vel = (position - self.prev_raw_pose) / dt
+                    alpha = self.velocity_filter_alpha
+                    self.filtered_velocity = (
+                        alpha * raw_vel
+                        + (1.0 - alpha) * self.filtered_velocity
+                    )
+                    velocity = self.filtered_velocity.copy()
             
             # Update state directly from raw measurements
             self.current_state[0:3] = position
@@ -494,6 +565,15 @@ class DockingControllerNode(Node):
             float(msg.data[2]),
         ])
         self.has_vision_raw_pose = True
+
+    def ground_truth_callback(self, msg: PoseStamped):
+        """Cache Isaac Sim ground-truth pose (world / chaser frame)."""
+        self.isaac_gt_pose = np.array([
+            float(msg.pose.position.x),
+            float(msg.pose.position.y),
+            float(msg.pose.position.z),
+        ])
+        self.has_isaac_gt_pose = True
     
     def command_callback(self, msg: String):
         """Handle high-level docking commands."""
@@ -522,6 +602,10 @@ class DockingControllerNode(Node):
         self.is_docking_active = True
         self.control_enabled = True
         self.current_phase = DockingPhase.FAR_RANGE
+        self.controller.reset()
+        self.smoothed_force_cmd = np.zeros(3)
+        self.smoothed_velocity_cmd = np.zeros(3)
+        self.filtered_velocity = np.zeros(3)
         
         # Generate approach trajectory
         self.reference_trajectory = self.trajectory_generator.generate_v_bar_approach(
@@ -536,7 +620,9 @@ class DockingControllerNode(Node):
         """Stop docking (controlled stop)."""
         self.is_docking_active = False
         self.target_state = self.current_state.copy()
-        self.target_state[3:6] = 0.0  # Zero velocity target
+        self.target_state[3:6] = 0.0
+        self.controller.reset()
+        self._publish_zero_control()
         
         self.get_logger().info('Docking stopped - holding position')
     
@@ -545,6 +631,7 @@ class DockingControllerNode(Node):
         self.is_docking_active = False
         self.control_enabled = False
         self.current_phase = DockingPhase.HOLD
+        self.controller.reset()
         
         # Publish zero commands
         self._publish_zero_control()
@@ -593,18 +680,35 @@ class DockingControllerNode(Node):
             self.current_state,
             self.target_state
         )
+
+        # Auto-hold when PID reports terminal convergence
+        if (self.auto_hold_on_complete and
+                getattr(self.controller, 'docking_complete', False)):
+            if self.is_docking_active:
+                self.get_logger().info(
+                    'Docking complete — auto-hold (within terminal threshold)',
+                    throttle_duration_sec=5.0,
+                )
+                self.is_docking_active = False
+            control_accel = np.zeros(3)
+            self._publish_zero_control()
+            if self.enable_data_logging:
+                pos_error = self.target_state[0:3] - self.current_state[0:3]
+                range_m = float(np.linalg.norm(pos_error))
+                range_rate = closing_velocity(pos_error, self.current_state[3:6])
+                self._log_data(
+                    self.current_state[0:3], range_m, range_rate,
+                    control_accel, self.smoothed_velocity_cmd,
+                )
+            self._publish_state()
+            self._update_phase()
+            return
         
-        # Log control computation with range and range rate
-        pos_error = self.current_state[0:3] - self.target_state[0:3]
+        # Consistent error convention: target - current (negative range_rate = closing)
+        pos_error = self.target_state[0:3] - self.current_state[0:3]
         vel = self.current_state[3:6]
-        distance = np.linalg.norm(pos_error)
-        
-        # Compute range rate (closing velocity)
-        if distance > 0.001:
-            range_dir = pos_error / distance
-            range_rate = np.dot(vel, range_dir)  # Negative = approaching
-        else:
-            range_rate = 0.0
+        distance = float(np.linalg.norm(pos_error))
+        range_rate = closing_velocity(pos_error, vel)
         
         self.get_logger().info(
             f'Range: {distance:.3f}m | Rate: {range_rate*100:.2f}cm/s | '
@@ -612,8 +716,8 @@ class DockingControllerNode(Node):
             throttle_duration_sec=1.0
         )
         
-        # Camera-frame PID output -> Isaac world frame (force was not remapped before)
-        control_isaac = self._remap_camera_to_isaac(control_accel)
+        # Camera-frame PID output -> Isaac world frame
+        control_isaac = camera_to_isaac_vector(control_accel, self.frame_remap)
         control_force = control_isaac * self.spacecraft_mass
         if self.force_smoothing > 0.0:
             alpha_f = 1.0 - self.force_smoothing
@@ -629,6 +733,7 @@ class DockingControllerNode(Node):
         self._publish_wrench(force_out)
         self._publish_twist(control_isaac, in_isaac_frame=True)
         self._publish_isaac_force(force_out)
+        self._publish_isaac_state()
         
         # Log data for plotting
         if self.enable_data_logging:
@@ -637,7 +742,9 @@ class DockingControllerNode(Node):
                 distance,
                 range_rate,
                 control_accel,
-                self.smoothed_velocity_cmd
+                self.smoothed_velocity_cmd,
+                control_isaac,
+                control_force,
             )
         
         # Publish state
@@ -681,18 +788,25 @@ class DockingControllerNode(Node):
             self.current_phase = DockingPhase.TERMINAL
     
     def _remap_camera_to_isaac(self, cam_cmd: np.ndarray) -> np.ndarray:
-        """Map camera/pose frame command to Isaac (X=fwd, Y=left, Z=up).
+        """Map camera/pose frame command to Isaac (X=fwd, Y=left, Z=up)."""
+        return camera_to_isaac_vector(cam_cmd, self.frame_remap)
 
-        Camera (pose / URSO): X=right, Y=down, Z=forward (depth).
-        """
-        cam_x = float(cam_cmd[0])
-        cam_y = float(cam_cmd[1])
-        cam_z = float(cam_cmd[2])
-        return np.array([
-            cam_z * self.axis_invert_x,
-            -cam_x * self.axis_invert_y,
-            -cam_y * self.axis_invert_z,
-        ])
+    def _publish_isaac_state(self):
+        """Publish pose in Isaac frame for debugging / comparison."""
+        cam_pos = self.current_state[0:3]
+        isaac_pos = camera_to_isaac_vector(cam_pos, self.frame_remap)
+        msg = Float64MultiArray()
+        msg.data = [
+            float(isaac_pos[0]), float(isaac_pos[1]), float(isaac_pos[2]),
+            float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2]),
+        ]
+        if self.has_isaac_gt_pose:
+            msg.data.extend([
+                float(self.isaac_gt_pose[0]),
+                float(self.isaac_gt_pose[1]),
+                float(self.isaac_gt_pose[2]),
+            ])
+        self.isaac_state_pub.publish(msg)
 
     def _publish_wrench(self, force: np.ndarray):
         """Publish WrenchStamped for Isaac Sim (force already in Isaac frame)."""
@@ -784,8 +898,15 @@ class DockingControllerNode(Node):
             # Write CSV header
             self.log_file.write(
                 'time,raw_pos_x,raw_pos_y,raw_pos_z,'
-                'pos_x,pos_y,pos_z,range,range_rate,'
-                'ctrl_x,ctrl_y,ctrl_z,twist_x,twist_y,twist_z\n'
+                'pos_x,pos_y,pos_z,'
+                'isaac_pos_x,isaac_pos_y,isaac_pos_z,'
+                'gt_pos_x,gt_pos_y,gt_pos_z,'
+                'err_x,err_y,err_z,'
+                'range,range_rate,'
+                'ctrl_x,ctrl_y,ctrl_z,'
+                'force_isaac_x,force_isaac_y,force_isaac_z,'
+                'twist_x,twist_y,twist_z,'
+                'pid_p_z,pid_i_z,pid_d_z,docking_complete\n'
             )
             self.log_start_time = self.get_clock().now().nanoseconds / 1e9
             self.get_logger().info(f'Data logging enabled: {self.log_file_path}')
@@ -793,7 +914,8 @@ class DockingControllerNode(Node):
             self.get_logger().error(f'Failed to initialize data logger: {e}')
             self.enable_data_logging = False
     
-    def _log_data(self, pos, range_m, range_rate, control, twist):
+    def _log_data(self, pos, range_m, range_rate, control, twist,
+                  control_isaac=None, force_isaac=None):
         """Log data point to CSV file."""
         if not self.enable_data_logging or self.log_file is None:
             return
@@ -803,28 +925,52 @@ class DockingControllerNode(Node):
                 rp = self.vision_raw_pose
             else:
                 rp = np.array([np.nan, np.nan, np.nan])
+
+            isaac_pos = camera_to_isaac_vector(pos, self.frame_remap)
+            if self.has_isaac_gt_pose:
+                gt = self.isaac_gt_pose
+            else:
+                gt = np.array([np.nan, np.nan, np.nan])
+
+            err = self.target_state[0:3] - pos
+            diag = getattr(self.controller, 'last_diag', {})
+            p_z = diag.get('p_term', np.zeros(3))[2] if diag else 0.0
+            i_z = diag.get('i_term', np.zeros(3))[2] if diag else 0.0
+            d_z = diag.get('d_term', np.zeros(3))[2] if diag else 0.0
+            complete = int(diag.get('docking_complete', False))
+
+            fi = force_isaac if force_isaac is not None else np.zeros(3)
+
             self.log_file.write(
                 f'{t:.3f},{rp[0]:.4f},{rp[1]:.4f},{rp[2]:.4f},'
                 f'{pos[0]:.4f},{pos[1]:.4f},{pos[2]:.4f},'
+                f'{isaac_pos[0]:.4f},{isaac_pos[1]:.4f},{isaac_pos[2]:.4f},'
+                f'{gt[0]:.4f},{gt[1]:.4f},{gt[2]:.4f},'
+                f'{err[0]:.4f},{err[1]:.4f},{err[2]:.4f},'
                 f'{range_m:.4f},{range_rate:.4f},'
                 f'{control[0]:.6f},{control[1]:.6f},{control[2]:.6f},'
-                f'{twist[0]:.6f},{twist[1]:.6f},{twist[2]:.6f}\n'
+                f'{fi[0]:.4f},{fi[1]:.4f},{fi[2]:.4f},'
+                f'{twist[0]:.6f},{twist[1]:.6f},{twist[2]:.6f},'
+                f'{p_z:.6f},{i_z:.6f},{d_z:.6f},{complete}\n'
             )
-            self.log_file.flush()  # Ensure data is written
+            self.log_file.flush()
         except Exception as e:
             self.get_logger().warn(f'Failed to log data: {e}')
     
     def publish_status(self):
         """Publish docking status (periodic)."""
-        range_m = np.linalg.norm(self.current_state[0:3])
-        range_rate = np.dot(self.current_state[0:3], self.current_state[3:6]) / max(range_m, 0.01)
+        pos_error = self.target_state[0:3] - self.current_state[0:3]
+        range_m = float(np.linalg.norm(pos_error))
+        range_rate = closing_velocity(pos_error, self.current_state[3:6])
+        complete = getattr(self.controller, 'docking_complete', False)
         
         status = (
             f"Phase: {self.current_phase.value} | "
-            f"Range: {range_m:.2f}m | "
-            f"Rate: {range_rate:.3f}m/s | "
+            f"Range: {range_m:.3f}m | "
+            f"Closing: {range_rate*100:.2f}cm/s | "
             f"Controller: {self.controller_type} | "
-            f"Active: {self.is_docking_active}"
+            f"Active: {self.is_docking_active} | "
+            f"Complete: {complete}"
         )
         
         msg = String()

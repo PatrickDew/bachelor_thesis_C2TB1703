@@ -57,158 +57,204 @@ class BaseController(ABC):
 
 class PIDController(BaseController):
     """
-    PID Controller for Spacecraft Docking
-    
-    Implements decoupled PID control for position and attitude.
-    Includes anti-windup for integral terms.
-    
+    Robust 3-DOF PID controller for vision-based spacecraft docking.
+
+    Control law (camera / relative pose frame):
+        u = Kp·e + Ki·∫e dt − Kd·v + Kv·(v_d − v)·ê_r + u_los + u_ff
+
+    where e = p_d − p, v is measured velocity, ê_r is the unit vector toward
+    the target, and u_los adds extra lateral (cross-track) correction for
+    direct line-of-sight alignment.
+
     Features:
-    - Separate gains for each axis (6-DOF)
-    - Integral anti-windup
-    - Derivative filtering
-    - Feed-forward velocity tracking
+    - Derivative on measured velocity (robust to noisy vision)
+    - Back-calculation integral anti-windup
+    - Range-based gain scheduling
+    - Terminal hold zone (zero command when docked)
+    - Optional CW feedforward for orbital scenarios
     """
-    
+
     def __init__(self, dynamics: ClohessyWiltshireDynamics,
                  limits: Optional[ControlLimits] = None):
         super().__init__(dynamics, limits)
-        
-        # Position PID gains [kp, ki, kd] for each axis
-        # Tuned for typical docking scenario
-        self.kp = np.array([0.01, 0.01, 0.01])   # Proportional
-        self.ki = np.array([0.001, 0.001, 0.001]) # Integral
-        self.kd = np.array([0.1, 0.1, 0.1])       # Derivative
-        
-        # Velocity feedback gains (optional)
-        self.kv = np.array([0.05, 0.05, 0.05])
-        
+
+        # Cartesian PID gains (per axis)
+        self.kp = np.array([0.008, 0.008, 0.012])
+        self.ki = np.array([0.0005, 0.0005, 0.0008])
+        self.kd = np.array([0.15, 0.15, 0.20])   # velocity damping
+        self.kv = np.array([0.08, 0.08, 0.12])   # range-rate tracking
+
+        # Line-of-sight lateral correction (cross-track alignment)
+        self.use_los_guidance = True
+        self.kp_lateral = 0.015
+        self.ki_lateral = 0.001
+        self.kd_lateral = 0.12
+
         # Internal state
         self.integral_error = np.zeros(3)
+        self.lateral_integral = np.zeros(3)
         self.prev_error = np.zeros(3)
-        self.prev_derivative = np.zeros(3)
-        
-        # Anti-windup limits
-        self.integral_max = np.array([10.0, 10.0, 10.0])
-        
-        # Derivative filter coefficient (0-1, higher = more filtering)
-        self.derivative_filter = 0.8
-        
-        # Gain scheduling based on range
+
+        # Anti-windup
+        self.integral_max = np.array([2.0, 2.0, 2.0])
+        self.use_backcalc_antiwindup = True
+
+        # Terminal hold — stop when within threshold with low velocity
+        self.docking_complete_range = 0.05      # m
+        self.docking_complete_velocity = 0.002  # m/s
+        self.docking_complete = False
+
+        # Gain scheduling
         self.use_gain_scheduling = True
-        
-        # CW feedforward mode
-        # Set to False for stationary/ground-test scenarios (no orbital dynamics)
-        # Set to True only if Isaac Sim models actual orbital environment
-        self.use_cw_feedforward = False  # Default OFF for stationary ISS
-    
+        self.use_cw_feedforward = False
+
+        # Diagnostics from last compute_control call
+        self.last_diag: dict = {}
+
     def set_gains(self, kp: np.ndarray, ki: np.ndarray, kd: np.ndarray):
         """Set PID gains."""
-        self.kp = np.asarray(kp)
-        self.ki = np.asarray(ki)
-        self.kd = np.asarray(kd)
-    
+        self.kp = np.asarray(kp, dtype=float)
+        self.ki = np.asarray(ki, dtype=float)
+        self.kd = np.asarray(kd, dtype=float)
+
     def compute_control(self, current_state: np.ndarray,
                         target_state: np.ndarray) -> np.ndarray:
         """
-        Compute CW-aware adaptive PID control output.
-        
-        This controller integrates Clohessy-Wiltshire dynamics for proper
-        spacecraft proximity operations. It includes:
-        - CW feedforward compensation for orbital effects
-        - Range-based adaptive gain scheduling
-        - Range-rate control for approach velocity management
-        
+        Compute PID control acceleration in the pose estimation frame.
+
         Args:
             current_state: [x, y, z, vx, vy, vz]
             target_state: [x_d, y_d, z_d, vx_d, vy_d, vz_d]
-            
+
         Returns:
             Control acceleration [ax, ay, az]
         """
-        # Extract positions and velocities
         pos = current_state[0:3]
         vel = current_state[3:6]
         pos_target = target_state[0:3]
         vel_target = target_state[3:6]
-        
-        # Position error vector: target - current (standard regulation convention)
-        # Error points FROM current position TO target
-        # Positive X error means "target is in +X direction, move +X to reach it"
+
         pos_error = pos_target - pos
-        
-        # Range (distance to target) and direction
-        range_m = np.linalg.norm(pos_error)
-        if range_m > 0.001:  # Avoid division by zero
-            # range_dir points FROM spacecraft TOWARDS target
+        vel_error = vel - vel_target
+
+        range_m = float(np.linalg.norm(pos_error))
+        if range_m > 1e-6:
             range_dir = pos_error / range_m
         else:
             range_dir = np.zeros(3)
-        
-        # Range rate (closing velocity, negative = approaching)
-        range_rate = np.dot(vel, range_dir)
-        
-        # Desired range rate: slow approach velocity based on range
-        # Closer = slower approach (safety)
-        # NOTE: Keeping this gentle to avoid fighting position control
+
+        speed = float(np.linalg.norm(vel_error))
+
+        # Terminal hold — convergence to zero steady-state error
+        if (range_m < self.docking_complete_range and
+                speed < self.docking_complete_velocity):
+            self.docking_complete = True
+            self._record_diag(
+                pos_error, vel_error, range_m, range_dir,
+                np.zeros(3), np.zeros(3), np.zeros(3),
+                np.zeros(3), np.zeros(3), True,
+            )
+            return np.zeros(3)
+
+        self.docking_complete = False
+
+        # Desired closing velocity (negative = approaching)
         if range_m > 10.0:
-            desired_range_rate = -0.03  # 3 cm/s approach when far
+            desired_range_rate = -0.03
         elif range_m > 1.0:
-            desired_range_rate = -0.01  # 1 cm/s approach when mid-range
+            desired_range_rate = -0.01
+        elif range_m > 0.2:
+            desired_range_rate = -0.005
         else:
-            desired_range_rate = -0.003  # 0.3 cm/s approach when close (very slow final)
-        
-        # Range rate error (only apply if moving too fast, not if too slow)
+            desired_range_rate = -0.001
+
+        range_rate = float(np.dot(vel_error, range_dir))
         range_rate_error = range_rate - desired_range_rate
-        
-        # Only brake if going too fast (don't push if going slow - let position control handle it)
-        if range_rate_error < 0:
-            range_rate_error = 0.0  # Don't add forward thrust, just brake if too fast
-        
-        # Gain scheduling based on range
-        if self.use_gain_scheduling:
-            gain_scale = self._compute_gain_scale(range_m)
-            kp = self.kp * gain_scale
-            ki = self.ki * gain_scale
-            kd = self.kd * gain_scale
-        else:
-            kp, ki, kd = self.kp, self.ki, self.kd
-        
-        # ===== PID Terms =====
-        
-        # Proportional term (position error)
+
+        gain_scale = self._compute_gain_scale(range_m) if self.use_gain_scheduling else 1.0
+        kp = self.kp * gain_scale
+        ki = self.ki * gain_scale
+        kd = self.kd * gain_scale
+        kv = self.kv * gain_scale
+
+        # --- Proportional ---
         p_term = kp * pos_error
-        
-        # Integral term with anti-windup
+
+        # --- Integral with back-calculation anti-windup ---
         self.integral_error += pos_error * self.dt
-        self.integral_error = np.clip(self.integral_error,
-                                       -self.integral_max,
-                                       self.integral_max)
+        self.integral_error = np.clip(
+            self.integral_error, -self.integral_max, self.integral_max,
+        )
         i_term = ki * self.integral_error
-        
-        # Derivative term with filtering
-        raw_derivative = (pos_error - self.prev_error) / self.dt
-        filtered_derivative = (self.derivative_filter * self.prev_derivative + 
-                              (1 - self.derivative_filter) * raw_derivative)
-        d_term = kd * filtered_derivative
-        self.prev_derivative = filtered_derivative
-        self.prev_error = pos_error.copy()
-        
-        # ===== CW Feedforward Compensation =====
-        # Only apply if in orbital environment (not stationary ISS)
-        if self.use_cw_feedforward:
-            cw_ff = self._compute_cw_feedforward(current_state)
+
+        # --- Derivative on measured velocity (avoids derivative kick) ---
+        d_term = -kd * vel_error
+
+        # --- Range-rate control along line-of-sight ---
+        range_rate_control = kv[0] * range_rate_error * range_dir
+
+        # --- Line-of-sight lateral guidance (cross-track alignment) ---
+        if self.use_los_guidance and range_m > 1e-6:
+            radial_component = np.dot(pos_error, range_dir) * range_dir
+            lateral_error = pos_error - radial_component
+            lateral_vel = vel_error - np.dot(vel_error, range_dir) * range_dir
+
+            self.lateral_integral += lateral_error * self.dt
+            self.lateral_integral = np.clip(
+                self.lateral_integral, -self.integral_max, self.integral_max,
+            )
+            los_term = (
+                self.kp_lateral * gain_scale * lateral_error
+                + self.ki_lateral * gain_scale * self.lateral_integral
+                - self.kd_lateral * gain_scale * lateral_vel
+            )
         else:
-            cw_ff = np.zeros(3)  # No orbital dynamics in stationary mode
-        
-        # ===== Range Rate Control =====
-        # Additional control to maintain desired approach velocity
-        range_rate_control = self.kv[0] * range_rate_error * range_dir
-        
-        # ===== Combined Control =====
-        # PID + optional CW feedforward + range rate control
-        control = p_term + i_term + d_term + cw_ff + range_rate_control
-        
-        return self.saturate(control)
+            los_term = np.zeros(3)
+
+        # --- CW feedforward (orbital scenarios only) ---
+        cw_ff = self._compute_cw_feedforward(current_state) if self.use_cw_feedforward else np.zeros(3)
+
+        control_unsat = p_term + i_term + d_term + range_rate_control + los_term + cw_ff
+        control_sat = self.saturate(control_unsat)
+
+        # Back-calculation anti-windup: bleed integral when saturated
+        if self.use_backcalc_antiwindup:
+            for i in range(3):
+                if ki[i] > 1e-12:
+                    self.integral_error[i] += (
+                        (control_sat[i] - control_unsat[i]) / ki[i]
+                    )
+            self.integral_error = np.clip(
+                self.integral_error, -self.integral_max, self.integral_max,
+            )
+
+        self.prev_error = pos_error.copy()
+        self._record_diag(
+            pos_error, vel_error, range_m, range_dir,
+            p_term, i_term, d_term, range_rate_control, los_term,
+            False,
+        )
+        return control_sat
+
+    def _record_diag(
+        self,
+        pos_error, vel_error, range_m, range_dir,
+        p_term, i_term, d_term, rr_term, los_term, complete,
+    ):
+        """Store diagnostics for logging and analysis."""
+        self.last_diag = {
+            'pos_error': pos_error.copy(),
+            'vel_error': vel_error.copy(),
+            'range_m': range_m,
+            'range_dir': range_dir.copy(),
+            'p_term': p_term.copy(),
+            'i_term': i_term.copy(),
+            'd_term': d_term.copy(),
+            'range_rate_control': rr_term.copy(),
+            'los_term': los_term.copy(),
+            'docking_complete': complete,
+            'range_rate': float(np.dot(vel_error, range_dir)) if range_m > 1e-6 else 0.0,
+        }
     
     def _compute_cw_feedforward(self, state: np.ndarray) -> np.ndarray:
         """
@@ -257,8 +303,10 @@ class PIDController(BaseController):
     def reset(self):
         """Reset integral and derivative states."""
         self.integral_error = np.zeros(3)
+        self.lateral_integral = np.zeros(3)
         self.prev_error = np.zeros(3)
-        self.prev_derivative = np.zeros(3)
+        self.docking_complete = False
+        self.last_diag = {}
 
 
 class LQRController(BaseController):

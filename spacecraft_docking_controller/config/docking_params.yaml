@@ -20,11 +20,20 @@ docking_controller_node:
     max_force: 50.0               # N (per axis)
     max_torque: 5.0               # N*m (per axis)
     
-    # PID Controller Gains (SLOW, SMOOTH approach for docking)
-    pid_kp: [0.003, 0.003, 0.003]   # Very low proportional for slow approach
-    pid_ki: [0.0001, 0.0001, 0.0001] # Small integral for steady-state
-    pid_kd: [0.03, 0.03, 0.03]      # Higher derivative for damping oscillations
-    pid_kv: [0.0, 0.0, 0.0]         # Range-rate control disabled
+    # PID Controller Gains — robust vision-based docking (camera frame)
+    pid_kp: [0.012, 0.012, 0.018]
+    pid_ki: [0.0008, 0.0008, 0.0012]
+    pid_kd: [0.18, 0.18, 0.22]
+    pid_kv: [0.10, 0.10, 0.14]
+    use_los_guidance: true
+    pid_kp_lateral: 0.020
+    pid_ki_lateral: 0.0015
+    pid_kd_lateral: 0.15
+    docking_complete_range: 0.05
+    docking_complete_velocity: 0.002
+    auto_hold_on_complete: true
+    velocity_filter_alpha: 0.35
+    ground_truth_topic: "/spacecraft/ground_truth_pose"
     
     # Orbital Dynamics Mode
     # Set to false for STATIONARY scenarios (no orbital gravity, ground test, simple 3D)
@@ -59,7 +68,7 @@ docking_controller_node:
     log_vision_raw_pose: true     # Also log /vision_benchmark/pose_xyz_quat (raw, pre-bridge)
     vision_raw_pose_topic: "/vision_benchmark/pose_xyz_quat"
     # Default on lab machine; override per PC or: export DOCKING_LOG_DIRECTORY=...
-    log_directory: "/home/sichentao/Documents/spacecraft_docking_controller/logs"
+    log_directory: ""   # empty = auto-resolve to <package>/logs
     
     # Docking Approach Parameters
     approach_type: "v_bar"        # "v_bar" or "r_bar"
