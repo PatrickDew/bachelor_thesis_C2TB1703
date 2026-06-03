@@ -86,9 +86,15 @@ class PIDController(BaseController):
 
         # Line-of-sight lateral correction (cross-track alignment)
         self.use_los_guidance = True
+        self.use_los_decomposed = True   # Radial+lateral only (no double-counting)
         self.kp_lateral = 0.015
         self.ki_lateral = 0.001
         self.kd_lateral = 0.12
+        self.kp_radial_scale = 1.0       # Extra gain on depth/range axis
+
+        # Range-rate: 'brake_only' = never push forward, only slow down if too fast
+        self.range_rate_mode = 'brake_only'
+        self.max_closing_rate = 0.003    # m/s — cap commanded approach speed
 
         # Internal state
         self.integral_error = np.zeros(3)
@@ -164,41 +170,152 @@ class PIDController(BaseController):
         elif range_m > 1.0:
             desired_range_rate = -0.01
         elif range_m > 0.2:
-            desired_range_rate = -0.005
+            desired_range_rate = -0.002
         else:
-            desired_range_rate = -0.001
+            desired_range_rate = -0.0008
 
         range_rate = float(np.dot(vel_error, range_dir))
         range_rate_error = range_rate - desired_range_rate
 
         gain_scale = self._compute_gain_scale(range_m) if self.use_gain_scheduling else 1.0
-        kp = self.kp * gain_scale
-        ki = self.ki * gain_scale
-        kd = self.kd * gain_scale
-        kv = self.kv * gain_scale
 
-        # --- Proportional ---
+        if self.use_los_decomposed and range_m > 1e-6:
+            control_unsat = self._compute_los_decomposed(
+                pos_error, vel_error, range_dir, range_m,
+                range_rate, desired_range_rate, gain_scale,
+            )
+        else:
+            kp = self.kp * gain_scale
+            ki = self.ki * gain_scale
+            kd = self.kd * gain_scale
+            kv = self.kv * gain_scale
+            control_unsat = self._compute_cartesian(
+                pos_error, vel_error, range_dir,
+                range_rate_error, kp, ki, kd, kv, gain_scale, range_m,
+            )
+            if self.use_cw_feedforward:
+                control_unsat += self._compute_cw_feedforward(current_state)
+
+        control_sat = self.saturate(control_unsat)
+
+        if self.use_backcalc_antiwindup and not self.use_los_decomposed:
+            ki = self.ki * gain_scale
+            for i in range(3):
+                if ki[i] > 1e-12:
+                    self.integral_error[i] += (
+                        (control_sat[i] - control_unsat[i]) / ki[i]
+                    )
+            self.integral_error = np.clip(
+                self.integral_error, -self.integral_max, self.integral_max,
+            )
+
+        self.prev_error = pos_error.copy()
+        diag = self.last_diag if self.use_los_decomposed else {}
+        if not diag:
+            diag = {
+                'p_term': np.zeros(3), 'i_term': np.zeros(3),
+                'd_term': np.zeros(3), 'range_rate_control': np.zeros(3),
+                'los_term': np.zeros(3),
+            }
+        self._record_diag(
+            pos_error, vel_error, range_m, range_dir,
+            diag.get('p_term', np.zeros(3)),
+            diag.get('i_term', np.zeros(3)),
+            diag.get('d_term', np.zeros(3)),
+            diag.get('range_rate_control', np.zeros(3)),
+            diag.get('los_term', np.zeros(3)),
+            False,
+        )
+        return control_sat
+
+    def _compute_los_decomposed(
+        self,
+        pos_error: np.ndarray,
+        vel_error: np.ndarray,
+        range_dir: np.ndarray,
+        range_m: float,
+        range_rate: float,
+        desired_range_rate: float,
+        gain_scale: float,
+    ) -> np.ndarray:
+        """Line-of-sight PID: approach along depth, align lateral (no axis double-count)."""
+        radial_error = float(np.dot(pos_error, range_dir))
+        radial_vel = float(np.dot(vel_error, range_dir))
+        lateral_error = pos_error - radial_error * range_dir
+        lateral_vel = vel_error - radial_vel * range_dir
+
+        gs = gain_scale
+        kp_r = self.kp[2] * gs * self.kp_radial_scale
+        ki_r = self.ki[2] * gs
+        kd_r = self.kd[2] * gs
+
+        self.integral_error[2] += radial_error * self.dt
+        self.integral_error[2] = np.clip(
+            self.integral_error[2], -self.integral_max[2], self.integral_max[2],
+        )
+        self.lateral_integral += lateral_error * self.dt
+        self.lateral_integral = np.clip(
+            self.lateral_integral, -self.integral_max, self.integral_max,
+        )
+
+        u_radial = (
+            kp_r * radial_error
+            + ki_r * self.integral_error[2]
+            - kd_r * radial_vel
+        )
+        u_lateral = (
+            self.kp_lateral * gs * lateral_error
+            + self.ki_lateral * gs * self.lateral_integral
+            - self.kd_lateral * gs * lateral_vel
+        )
+
+        range_rate_error = range_rate - desired_range_rate
+        if self.range_rate_mode == 'brake_only':
+            u_rr = self.kv[2] * gs * range_rate_error if range_rate < desired_range_rate else 0.0
+        else:
+            u_rr = self.kv[2] * gs * range_rate_error
+
+        if radial_vel < -self.max_closing_rate and u_radial < 0:
+            u_radial *= 0.3
+
+        u_radial_vec = (u_radial + u_rr) * range_dir
+        control = u_radial_vec + u_lateral
+
+        self.last_diag = {
+            'p_term': kp_r * radial_error * range_dir + self.kp_lateral * gs * lateral_error,
+            'i_term': ki_r * self.integral_error[2] * range_dir + self.ki_lateral * gs * self.lateral_integral,
+            'd_term': -kd_r * radial_vel * range_dir - self.kd_lateral * gs * lateral_vel,
+            'range_rate_control': u_rr * range_dir,
+            'los_term': u_lateral,
+        }
+        return control
+
+    def _compute_cartesian(
+        self,
+        pos_error, vel_error, range_dir, range_rate_error,
+        kp, ki, kd, kv, gain_scale, range_m,
+    ) -> np.ndarray:
+        """Legacy decoupled Cartesian PID."""
         p_term = kp * pos_error
-
-        # --- Integral with back-calculation anti-windup ---
         self.integral_error += pos_error * self.dt
         self.integral_error = np.clip(
             self.integral_error, -self.integral_max, self.integral_max,
         )
         i_term = ki * self.integral_error
-
-        # --- Derivative on measured velocity (avoids derivative kick) ---
         d_term = -kd * vel_error
 
-        # --- Range-rate control along line-of-sight ---
-        range_rate_control = kv[0] * range_rate_error * range_dir
+        if self.range_rate_mode == 'brake_only' and range_rate_error > 0:
+            rr_scalar = 0.0
+        elif self.range_rate_mode == 'brake_only':
+            rr_scalar = kv[0] * range_rate_error
+        else:
+            rr_scalar = kv[0] * range_rate_error
+        range_rate_control = rr_scalar * range_dir
 
-        # --- Line-of-sight lateral guidance (cross-track alignment) ---
         if self.use_los_guidance and range_m > 1e-6:
             radial_component = np.dot(pos_error, range_dir) * range_dir
             lateral_error = pos_error - radial_component
             lateral_vel = vel_error - np.dot(vel_error, range_dir) * range_dir
-
             self.lateral_integral += lateral_error * self.dt
             self.lateral_integral = np.clip(
                 self.lateral_integral, -self.integral_max, self.integral_max,
@@ -211,30 +328,11 @@ class PIDController(BaseController):
         else:
             los_term = np.zeros(3)
 
-        # --- CW feedforward (orbital scenarios only) ---
-        cw_ff = self._compute_cw_feedforward(current_state) if self.use_cw_feedforward else np.zeros(3)
-
-        control_unsat = p_term + i_term + d_term + range_rate_control + los_term + cw_ff
-        control_sat = self.saturate(control_unsat)
-
-        # Back-calculation anti-windup: bleed integral when saturated
-        if self.use_backcalc_antiwindup:
-            for i in range(3):
-                if ki[i] > 1e-12:
-                    self.integral_error[i] += (
-                        (control_sat[i] - control_unsat[i]) / ki[i]
-                    )
-            self.integral_error = np.clip(
-                self.integral_error, -self.integral_max, self.integral_max,
-            )
-
-        self.prev_error = pos_error.copy()
-        self._record_diag(
-            pos_error, vel_error, range_m, range_dir,
-            p_term, i_term, d_term, range_rate_control, los_term,
-            False,
-        )
-        return control_sat
+        self.last_diag = {
+            'p_term': p_term, 'i_term': i_term, 'd_term': d_term,
+            'range_rate_control': range_rate_control, 'los_term': los_term,
+        }
+        return p_term + i_term + d_term + range_rate_control + los_term
 
     def _record_diag(
         self,

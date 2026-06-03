@@ -11,4 +11,4 @@ pose_array_bridge_node:
     invert_xyz: [1.0, 1.0, 1.0]
     # Vision pose is jumpier than FoundationPose; EMA helps match old smooth behaviour
     enable_position_smoothing: true
-    position_smoothing_alpha: 0.35
+    position_smoothing_alpha: 0.18

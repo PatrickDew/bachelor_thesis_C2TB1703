@@ -326,7 +326,10 @@ class DockingControllerNode(Node):
         self.declare_parameter('docking_complete_velocity', 0.002)
         self.declare_parameter('auto_hold_on_complete', True)
         self.declare_parameter('velocity_filter_alpha', 0.4)
-        self.declare_parameter('ground_truth_topic', '/spacecraft/ground_truth_pose')
+        self.declare_parameter('use_trajectory_tracking', False)
+        self.declare_parameter('pose_jump_threshold', 0.15)
+        self.declare_parameter('range_rate_mode', 'brake_only')
+        self.declare_parameter('max_closing_rate', 0.003)
         
         # CW Feedforward (set false for stationary ISS, true for orbital environment)
         self.declare_parameter('use_cw_feedforward', False)
@@ -402,6 +405,10 @@ class DockingControllerNode(Node):
         self.auto_hold_on_complete = self.get_parameter('auto_hold_on_complete').value
         self.velocity_filter_alpha = self.get_parameter('velocity_filter_alpha').value
         self.ground_truth_topic = self.get_parameter('ground_truth_topic').value
+        self.use_trajectory_tracking = self.get_parameter('use_trajectory_tracking').value
+        self.pose_jump_threshold = self.get_parameter('pose_jump_threshold').value
+        self.range_rate_mode = self.get_parameter('range_rate_mode').value
+        self.max_closing_rate = self.get_parameter('max_closing_rate').value
         self.use_cw_feedforward = self.get_parameter('use_cw_feedforward').value
         
         self.lqr_q_pos = self.get_parameter('lqr_q_pos').value
@@ -466,7 +473,9 @@ class DockingControllerNode(Node):
             controller.kd_lateral = self.pid_kd_lateral
             controller.docking_complete_range = self.docking_complete_range
             controller.docking_complete_velocity = self.docking_complete_velocity
-            mode = "ORBITAL (CW feedforward ON)" if self.use_cw_feedforward else "STATIONARY (vision PID + LOS)"
+            controller.range_rate_mode = self.range_rate_mode
+            controller.max_closing_rate = self.max_closing_rate
+            mode = "ORBITAL (CW feedforward ON)" if self.use_cw_feedforward else "STATIONARY (LOS PID, target=origin)"
             self.get_logger().info(f'PID mode: {mode}')
             self.get_logger().info(
                 f'PID: Kp={self.pid_kp}, Ki={self.pid_ki}, Kd={self.pid_kd}, Kv={self.pid_kv}'
@@ -506,7 +515,18 @@ class DockingControllerNode(Node):
         current_time = self.get_clock().now().nanoseconds / 1e9
         
         if self.use_direct_measurement:
-            # DIRECT MEASUREMENT MODE: Use raw pose directly (no EKF drift)
+            # Reject vision outliers (single-frame jumps)
+            if self.prev_raw_pose is not None:
+                jump = float(np.linalg.norm(position - self.prev_raw_pose))
+                if jump > self.pose_jump_threshold:
+                    self.get_logger().warn(
+                        f'Pose jump {jump:.3f}m rejected — using previous state',
+                        throttle_duration_sec=1.0,
+                    )
+                    if hasattr(self.controller, 'reset'):
+                        self.controller.reset()
+                    return
+
             self.raw_pose = position.copy()
             
             # Estimate velocity from finite differences with low-pass filter
@@ -598,7 +618,7 @@ class DockingControllerNode(Node):
         self.get_logger().info(f'Control {"enabled" if self.control_enabled else "disabled"}')
     
     def start_docking(self):
-        """Start docking sequence."""
+        """Start docking — vision mode: regulate to origin; skip LVLH trajectory."""
         self.is_docking_active = True
         self.control_enabled = True
         self.current_phase = DockingPhase.FAR_RANGE
@@ -606,15 +626,22 @@ class DockingControllerNode(Node):
         self.smoothed_force_cmd = np.zeros(3)
         self.smoothed_velocity_cmd = np.zeros(3)
         self.filtered_velocity = np.zeros(3)
-        
-        # Generate approach trajectory
-        self.reference_trajectory = self.trajectory_generator.generate_v_bar_approach(
-            self.current_state[0:3],
-            final_range=self.final_standoff
-        )
+
+        # Target = docking port at origin in vision/camera relative frame
+        self.target_state = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        self.reference_trajectory = None
         self.trajectory_index = 0
-        
-        self.get_logger().info('Docking sequence started')
+
+        if self.use_trajectory_tracking:
+            self.reference_trajectory = self.trajectory_generator.generate_v_bar_approach(
+                self.current_state[0:3],
+                final_range=self.final_standoff,
+            )
+            self.get_logger().info('Docking started (LVLH trajectory tracking)')
+        else:
+            self.get_logger().info(
+                'Docking started — direct regulation to origin [0,0,0] in camera frame'
+            )
     
     def stop_docking(self):
         """Stop docking (controlled stop)."""
@@ -671,8 +698,9 @@ class DockingControllerNode(Node):
             self._publish_zero_control()
             return
         
-        # Update target based on trajectory
-        if self.is_docking_active and self.reference_trajectory is not None:
+        # Update target based on trajectory (off by default for vision docking)
+        if (self.use_trajectory_tracking and self.is_docking_active
+                and self.reference_trajectory is not None):
             self._update_target_from_trajectory()
         
         # Compute control
@@ -719,6 +747,12 @@ class DockingControllerNode(Node):
         # Camera-frame PID output -> Isaac world frame
         control_isaac = camera_to_isaac_vector(control_accel, self.frame_remap)
         control_force = control_isaac * self.spacecraft_mass
+
+        # Hard cap force magnitude (safety for noisy vision)
+        force_mag = float(np.linalg.norm(control_force))
+        if force_mag > self.max_force:
+            control_force = control_force * (self.max_force / force_mag)
+
         if self.force_smoothing > 0.0:
             alpha_f = 1.0 - self.force_smoothing
             self.smoothed_force_cmd = (

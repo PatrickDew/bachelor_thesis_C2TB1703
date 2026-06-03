@@ -1,41 +1,42 @@
-# PID tuning overlay for isaac_multitask vision pose (isaac_vision_docking.launch.py)
-# Robust PID: velocity-feedback D-term, integral anti-windup, LOS lateral guidance
+# PID overlay for isaac_multitask vision (isaac_vision_docking.launch.py)
+# Tuned for ~1m standoff, noisy pose, Isaac Sim force control
 
 docking_controller_node:
   ros__parameters:
     controller_type: "PID"
-    control_rate: 30.0
-    velocity_smoothing: 0.75
-    force_smoothing: 0.55          # Lower = more responsive (was 0.85)
+    control_rate: 20.0
+    velocity_smoothing: 0.82
+    force_smoothing: 0.78
 
-    # Cartesian PID — camera frame (X=right, Y=down, Z=depth)
-    pid_kp: [0.012, 0.012, 0.018]   # Higher on Z (depth / range axis)
-    pid_ki: [0.0008, 0.0008, 0.0012] # Integral eliminates steady-state bias
-    pid_kd: [0.18, 0.18, 0.22]       # Velocity damping (not error derivative)
-    pid_kv: [0.10, 0.10, 0.14]       # Range-rate tracking along LOS
+    use_trajectory_tracking: false
+    range_rate_mode: "brake_only"
+    max_closing_rate: 0.002
 
-    # Line-of-sight lateral alignment (cross-track correction)
+    pid_kp: [0.004, 0.004, 0.006]
+    pid_ki: [0.0002, 0.0002, 0.0004]
+    pid_kd: [0.25, 0.25, 0.30]
+    pid_kv: [0.05, 0.05, 0.06]
+
     use_los_guidance: true
-    pid_kp_lateral: 0.020
-    pid_ki_lateral: 0.0015
-    pid_kd_lateral: 0.15
+    pid_kp_lateral: 0.008
+    pid_ki_lateral: 0.0004
+    pid_kd_lateral: 0.20
 
-    # Terminal hold — auto-stop when converged
-    docking_complete_range: 0.05       # 5 cm
-    docking_complete_velocity: 0.002   # 2 mm/s
+    docking_complete_range: 0.08
+    docking_complete_velocity: 0.003
     auto_hold_on_complete: true
-    velocity_filter_alpha: 0.35
+    velocity_filter_alpha: 0.25
+    pose_jump_threshold: 0.12
 
-    max_velocity_cmd: 0.006
-    max_force: 40.0
+    max_velocity_cmd: 0.003
+    max_force: 15.0
 
-    # Isaac X = forward (camera Z). Flip X if chaser moves away from target.
+    # SIGN TUNING: drift RIGHT -> try axis_invert_y: -1.0
+    # moves AWAY from target -> flip axis_invert_x
     axis_invert_x: -1.0
     axis_invert_y: 1.0
     axis_invert_z: 1.0
 
-    # Isaac Sim ground truth (publish from Action Graph for validation)
     ground_truth_topic: "/spacecraft/ground_truth_pose"
-
     log_vision_raw_pose: true
     vision_raw_pose_topic: "/vision_benchmark/pose_xyz_quat"
