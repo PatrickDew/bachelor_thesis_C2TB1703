@@ -13,10 +13,14 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         (os.path.join("share", package_name, "launch"), glob("launch/*.launch.py")),
-        (os.path.join("lib", package_name), ["scripts/isaac_multitask_node"]),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
+    entry_points={
+        "console_scripts": [
+            "isaac_multitask_node = vision_benchmark_ros.isaac_multitask_node:main",
+        ],
+    },
     maintainer="vision_benchmark",
     maintainer_email="user@example.com",
     description="Isaac Sim image subscriber with pose and instance segmentation.",
